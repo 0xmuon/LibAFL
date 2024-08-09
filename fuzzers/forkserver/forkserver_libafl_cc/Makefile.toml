@@ -13,6 +13,8 @@ LIBAFL_CXX = '${CARGO_TARGET_DIR}/${PROFILE_DIR}/libafl_cxx'
 FUZZER = '${CARGO_TARGET_DIR}/${PROFILE_DIR}/${FUZZER_NAME}'
 PROJECT_DIR = { script = ["pwd"] }
 
+
+
 [tasks.unsupported]
 script_runner = "@shell"
 script = '''
