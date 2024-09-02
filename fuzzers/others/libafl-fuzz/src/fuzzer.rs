@@ -46,13 +46,15 @@ use crate::{
     afl_stats::{AflStatsStage, CalibrationTime, FuzzTime, SyncTime},
     corpus::{set_corpus_filepath, set_solution_filepath},
     env_parser::AFL_DEFAULT_MAP_SIZE,
+    executor::find_afl_binary,
     feedback::{
         filepath::CustomFilepathToTestcaseFeedback, persistent_record::PersitentRecordFeedback,
         seed::SeedFeedback,
     },
     scheduler::SupportedSchedulers,
     stages::{mutational_stage::SupportedMutationalStages, time_tracker::TimeTrackingStageWrapper},
-    Opt, AFL_DEFAULT_INPUT_LEN_MAX, AFL_DEFAULT_INPUT_LEN_MIN, SHMEM_ENV_VAR,
+    Opt, AFL_DEFAULT_INPUT_LEN_MAX, AFL_DEFAULT_INPUT_LEN_MIN, AFL_HARNESS_FILE_INPUT,
+    SHMEM_ENV_VAR,
 };
 
 pub type LibaflFuzzState =
@@ -209,8 +211,31 @@ where
     // Create our Fuzzer
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
+    // Set LD_PRELOAD (Linux) && DYLD_INSERT_LIBRARIES (OSX) for target.
+    if let Some(preload_env) = &opt.afl_preload {
+        std::env::set_var("LD_PRELOAD", preload_env);
+        std::env::set_var("DYLD_INSERT_LIBRARIES", preload_env);
+    }
+
+    // Insert appropriate shared libraries if frida_mode
+    if opt.frida_mode {
+        if opt.frida_asan {
+            std::env::set_var("ASAN_OPTIONS", "detect_leaks=false");
+        }
+        let frida_bin = find_afl_binary("afl-frida-trace.so", Some(opt.executable.clone()))?
+            .display()
+            .to_string();
+        let preload = if let Some(preload_env) = &opt.afl_preload {
+            format!("{preload_env}:{frida_bin}")
+        } else {
+            frida_bin
+        };
+        std::env::set_var("LD_PRELOAD", &preload);
+        std::env::set_var("DYLD_INSERT_LIBRARIES", &preload);
+    }
+
     // Create the base Executor
-    let mut executor = base_executor(opt, &mut shmem_provider);
+    let mut executor = base_executor(opt, &mut shmem_provider, fuzzer_dir)?;
     // Set a custom exit code to be interpreted as a Crash if configured.
     if let Some(crash_exitcode) = opt.crash_exitcode {
         executor = executor.crash_exitcode(crash_exitcode);
@@ -220,24 +245,6 @@ where
     if !opt.no_autodict {
         executor = executor.autotokens(&mut tokens);
     };
-
-    // Set a custom directory for the current_input file if configured;
-    // Relevant only if harness input type is @@
-    if opt.harness_input_type.is_some() {
-        let mut file = get_unique_std_input_file();
-        if let Some(ext) = &opt.input_ext {
-            file = format!("{file}.{ext}");
-        }
-        if let Some(cur_input_dir) = &opt.cur_input_dir {
-            executor = executor.arg_input_file(cur_input_dir.join(file));
-        } else {
-            executor = executor.arg_input_file(fuzzer_dir.join(file));
-        }
-    } else if opt.cur_input_dir.is_some() {
-        return Err(Error::illegal_argument(
-            "cannot use AFL_TMPDIR with stdin input type.",
-        ));
-    }
 
     // Finalize and build our Executor
     let mut executor = executor
@@ -279,12 +286,6 @@ where
     // Tell [`SeedFeedback`] that we're done loading seeds; rendering it benign.
     fuzzer.feedback_mut().done_loading_seeds();
 
-    // Set LD_PRELOAD (Linux) && DYLD_INSERT_LIBRARIES (OSX) for target.
-    if let Some(preload_env) = &opt.afl_preload {
-        std::env::set_var("LD_PRELOAD", preload_env);
-        std::env::set_var("DYLD_INSERT_LIBRARIES", preload_env);
-    }
-
     // Create a Sync stage to sync from foreign fuzzers
     let sync_stage = IfStage::new(
         |_, _, _, _| Ok(is_main_node && !opt.foreign_sync_dirs.is_empty()),
@@ -321,7 +322,7 @@ where
 
         // Create the CmpLog executor.
         // Cmplog has 25% execution overhead so we give it double the timeout
-        let cmplog_executor = base_executor(opt, &mut shmem_provider)
+        let cmplog_executor = base_executor(opt, &mut shmem_provider, fuzzer_dir)?
             .timeout(Duration::from_millis(opt.hang_timeout * 2))
             .program(cmplog_executable_path)
             .build(tuple_list!(cmplog_observer))
@@ -392,10 +393,10 @@ where
 fn base_executor<'a>(
     opt: &'a Opt,
     shmem_provider: &'a mut StdShMemProvider,
-) -> ForkserverExecutorBuilder<'a, StdShMemProvider> {
+    fuzzer_dir: &PathBuf,
+) -> Result<ForkserverExecutorBuilder<'a, StdShMemProvider>, Error> {
     let mut executor = ForkserverExecutor::builder()
         .program(opt.executable.clone())
-        .shmem_provider(shmem_provider)
         .coverage_map_size(opt.map_size.unwrap_or(AFL_DEFAULT_MAP_SIZE))
         .debug_child(opt.debug_child)
         .is_persistent(opt.is_persistent)
@@ -409,10 +410,34 @@ fn base_executor<'a>(
     if let Some(kill_signal) = opt.kill_signal {
         executor = executor.kill_signal(kill_signal);
     }
-    if let Some(harness_input_type) = &opt.harness_input_type {
-        executor = executor.parse_afl_cmdline([harness_input_type]);
+    if opt.is_persistent || opt.qemu_mode || opt.unicorn_mode {
+        executor = executor.shmem_provider(shmem_provider);
     }
-    executor
+    // Set arguments for the target if necessary
+    for arg in &opt.target_args {
+        if arg == AFL_HARNESS_FILE_INPUT {
+            let mut file = get_unique_std_input_file();
+            if let Some(ext) = &opt.input_ext {
+                file = format!("{file}.{ext}");
+            }
+            if let Some(cur_input_dir) = &opt.cur_input_dir {
+                executor = executor.arg_input_file(cur_input_dir.join(file));
+            } else {
+                executor = executor.arg_input_file(fuzzer_dir.join(file));
+            }
+        } else {
+            executor = executor.arg(arg);
+        }
+    }
+    if opt.qemu_mode {
+        // We need to give the harness as the first argument to afl-qemu-trace.
+        executor = executor.arg(opt.executable.clone());
+        executor = executor.program(
+            find_afl_binary("afl-qemu-trace", Some(opt.executable.clone()))
+                .expect("to find afl-qemu-trace"),
+        );
+    }
+    Ok(executor)
 }
 
 pub fn fuzzer_target_mode(opt: &Opt) -> Cow<'static, str> {

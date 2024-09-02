@@ -6,6 +6,7 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::case_sensitive_file_extension_comparisons)]
 
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 mod afl_stats;
@@ -110,9 +111,7 @@ fn main() {
 /// The Configuration
 struct Opt {
     executable: PathBuf,
-
-    #[arg(value_parser = validate_harness_input_stdin)]
-    harness_input_type: Option<&'static str>,
+    target_args: Vec<String>,
 
     // NOTE: afl-fuzz does not accept multiple input directories
     #[arg(short = 'i')]
@@ -236,6 +235,8 @@ struct Opt {
     /// use binary-only instrumentation (FRIDA mode)
     #[arg(short = 'O')]
     frida_mode: bool,
+    #[clap(skip)]
+    frida_asan: bool,
     /// use binary-only instrumentation (QEMU mode)
     #[arg(short = 'Q')]
     qemu_mode: bool,
@@ -253,13 +254,6 @@ struct Opt {
     crash_mode: bool,
     #[clap(skip)]
     non_instrumented_mode: bool,
-}
-
-fn validate_harness_input_stdin(s: &str) -> Result<&'static str, String> {
-    if s != "@@" {
-        return Err("Unknown harness input type. Use \"@@\" for file, omit for stdin ".to_string());
-    }
-    Ok(AFL_HARNESS_FILE_INPUT)
 }
 
 #[allow(dead_code)]
