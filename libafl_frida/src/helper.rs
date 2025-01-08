@@ -1,7 +1,9 @@
 use core::fmt::{self, Debug, Formatter};
 use std::{
+    any::TypeId,
     cell::{Ref, RefCell, RefMut},
-    fs,
+    ffi::CStr,
+    fs::{self, read_to_string},
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -9,13 +11,14 @@ use std::{
 use frida_gum::{
     instruction_writer::InstructionWriter,
     stalker::{StalkerIterator, StalkerOutput, Transformer},
-    Gum, Module, ModuleDetails, ModuleMap, PageProtection,
+    Backend, Gum, ModuleDetails, ModuleMap, Script,
 };
-use libafl::{
-    inputs::{HasTargetBytes, Input},
-    Error,
+use frida_gum_sys::gchar;
+use libafl::Error;
+use libafl_bolts::{
+    cli::{FridaScriptBackend, FuzzerOptions},
+    tuples::MatchFirstType,
 };
-use libafl_bolts::{cli::FuzzerOptions, tuples::MatchFirstType};
 use libafl_targets::drcov::DrCovBasicBlock;
 #[cfg(unix)]
 use nix::sys::mman::{mmap_anonymous, MapFlags, ProtFlags};
@@ -32,31 +35,103 @@ use crate::cmplog_rt::CmpLogRuntime;
 use crate::{asan::asan_rt::AsanRuntime, coverage_rt::CoverageRuntime, drcov_rt::DrCovRuntime};
 
 /// The Runtime trait
-pub trait FridaRuntime: 'static + Debug {
+pub trait FridaRuntime: 'static + Debug + std::any::Any {
     /// Initialization
     fn init(
         &mut self,
         gum: &Gum,
-        ranges: &RangeMap<usize, (u16, String)>,
+        ranges: &RangeMap<u64, (u16, String)>,
         module_map: &Rc<ModuleMap>,
     );
     /// Deinitialization
     fn deinit(&mut self, gum: &Gum);
 
     /// Method called before execution
-    fn pre_exec<I: Input + HasTargetBytes>(&mut self, input: &I) -> Result<(), Error>;
+    fn pre_exec(&mut self, input_bytes: &[u8]) -> Result<(), Error>;
 
     /// Method called after execution
-    fn post_exec<I: Input + HasTargetBytes>(&mut self, input: &I) -> Result<(), Error>;
+    fn post_exec(&mut self, input_bytes: &[u8]) -> Result<(), Error>;
 }
 
+/// Use the runtime if closure evaluates to true
+pub struct IfElseRuntime<CB, FR1, FR2> {
+    closure: CB,
+    if_runtimes: FR1,
+    else_runtimes: FR2,
+}
+
+impl<CB, FR1, FR2> Debug for IfElseRuntime<CB, FR1, FR2>
+where
+    FR1: Debug,
+    FR2: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&self.if_runtimes, f)?;
+        Debug::fmt(&self.else_runtimes, f)?;
+        Ok(())
+    }
+}
+impl<CB, FR1, FR2> IfElseRuntime<CB, FR1, FR2> {
+    /// Constructor for this conditionally enabled runtime
+    pub fn new(closure: CB, if_runtimes: FR1, else_runtimes: FR2) -> Self {
+        Self {
+            closure,
+            if_runtimes,
+            else_runtimes,
+        }
+    }
+}
+
+impl<CB, FR1, FR2> FridaRuntime for IfElseRuntime<CB, FR1, FR2>
+where
+    CB: FnMut() -> Result<bool, Error> + 'static,
+    FR1: FridaRuntimeTuple + 'static,
+    FR2: FridaRuntimeTuple + 'static,
+{
+    fn init(
+        &mut self,
+        gum: &Gum,
+        ranges: &RangeMap<u64, (u16, String)>,
+        module_map: &Rc<ModuleMap>,
+    ) {
+        if (self.closure)().unwrap() {
+            self.if_runtimes.init_all(gum, ranges, module_map);
+        } else {
+            self.else_runtimes.init_all(gum, ranges, module_map);
+        }
+    }
+
+    fn deinit(&mut self, gum: &Gum) {
+        if (self.closure)().unwrap() {
+            self.if_runtimes.deinit_all(gum);
+        } else {
+            self.else_runtimes.deinit_all(gum);
+        }
+    }
+
+    fn pre_exec(&mut self, input_bytes: &[u8]) -> Result<(), Error> {
+        if (self.closure)()? {
+            self.if_runtimes.pre_exec_all(input_bytes)
+        } else {
+            self.else_runtimes.pre_exec_all(input_bytes)
+        }
+    }
+
+    fn post_exec(&mut self, input_bytes: &[u8]) -> Result<(), Error> {
+        if (self.closure)()? {
+            self.if_runtimes.post_exec_all(input_bytes)
+        } else {
+            self.else_runtimes.post_exec_all(input_bytes)
+        }
+    }
+}
 /// The tuple for Frida Runtime
 pub trait FridaRuntimeTuple: MatchFirstType + Debug {
     /// Initialization
     fn init_all(
         &mut self,
         gum: &Gum,
-        ranges: &RangeMap<usize, (u16, String)>,
+        ranges: &RangeMap<u64, (u16, String)>,
         module_map: &Rc<ModuleMap>,
     );
 
@@ -64,26 +139,26 @@ pub trait FridaRuntimeTuple: MatchFirstType + Debug {
     fn deinit_all(&mut self, gum: &Gum);
 
     /// Method called before execution
-    fn pre_exec_all<I: Input + HasTargetBytes>(&mut self, input: &I) -> Result<(), Error>;
+    fn pre_exec_all(&mut self, input_bytes: &[u8]) -> Result<(), Error>;
 
     /// Method called after execution
-    fn post_exec_all<I: Input + HasTargetBytes>(&mut self, input: &I) -> Result<(), Error>;
+    fn post_exec_all(&mut self, input_bytes: &[u8]) -> Result<(), Error>;
 }
 
 impl FridaRuntimeTuple for () {
     fn init_all(
         &mut self,
         _gum: &Gum,
-        _ranges: &RangeMap<usize, (u16, String)>,
+        _ranges: &RangeMap<u64, (u16, String)>,
         _module_map: &Rc<ModuleMap>,
     ) {
     }
     fn deinit_all(&mut self, _gum: &Gum) {}
 
-    fn pre_exec_all<I: Input + HasTargetBytes>(&mut self, _input: &I) -> Result<(), Error> {
+    fn pre_exec_all(&mut self, _input_bytes: &[u8]) -> Result<(), Error> {
         Ok(())
     }
-    fn post_exec_all<I: Input + HasTargetBytes>(&mut self, _input: &I) -> Result<(), Error> {
+    fn post_exec_all(&mut self, _input_bytes: &[u8]) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -96,7 +171,7 @@ where
     fn init_all(
         &mut self,
         gum: &Gum,
-        ranges: &RangeMap<usize, (u16, String)>,
+        ranges: &RangeMap<u64, (u16, String)>,
         module_map: &Rc<ModuleMap>,
     ) {
         self.0.init(gum, ranges, module_map);
@@ -108,14 +183,75 @@ where
         self.1.deinit_all(gum);
     }
 
-    fn pre_exec_all<I: Input + HasTargetBytes>(&mut self, input: &I) -> Result<(), Error> {
-        self.0.pre_exec(input)?;
-        self.1.pre_exec_all(input)
+    fn pre_exec_all(&mut self, input_bytes: &[u8]) -> Result<(), Error> {
+        self.0.pre_exec(input_bytes)?;
+        self.1.pre_exec_all(input_bytes)
     }
 
-    fn post_exec_all<I: Input + HasTargetBytes>(&mut self, input: &I) -> Result<(), Error> {
-        self.0.post_exec(input)?;
-        self.1.post_exec_all(input)
+    fn post_exec_all(&mut self, input_bytes: &[u8]) -> Result<(), Error> {
+        self.0.post_exec(input_bytes)?;
+        self.1.post_exec_all(input_bytes)
+    }
+}
+
+/// Vector of `FridaRuntime`
+#[derive(Debug)]
+pub struct FridaRuntimeVec(pub Vec<Box<dyn FridaRuntime>>);
+
+impl MatchFirstType for FridaRuntimeVec {
+    fn match_first_type<T: 'static>(&self) -> Option<&T> {
+        for member in &self.0 {
+            if TypeId::of::<T>() == member.type_id() {
+                let raw = std::ptr::from_ref::<dyn FridaRuntime>(&**member) as *const T;
+                return unsafe { raw.as_ref() };
+            }
+        }
+
+        None
+    }
+
+    fn match_first_type_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        for member in &mut self.0 {
+            if TypeId::of::<T>() == member.type_id() {
+                let raw = std::ptr::from_mut::<dyn FridaRuntime>(&mut **member) as *mut T;
+                return unsafe { raw.as_mut() };
+            }
+        }
+
+        None
+    }
+}
+
+impl FridaRuntimeTuple for FridaRuntimeVec {
+    fn init_all(
+        &mut self,
+        gum: &Gum,
+        ranges: &RangeMap<u64, (u16, String)>,
+        module_map: &Rc<ModuleMap>,
+    ) {
+        for runtime in &mut self.0 {
+            runtime.init(gum, ranges, module_map);
+        }
+    }
+
+    fn deinit_all(&mut self, gum: &Gum) {
+        for runtime in &mut self.0 {
+            runtime.deinit(gum);
+        }
+    }
+
+    fn pre_exec_all(&mut self, input_bytes: &[u8]) -> Result<(), Error> {
+        for runtime in &mut self.0 {
+            runtime.pre_exec(input_bytes)?;
+        }
+        Ok(())
+    }
+
+    fn post_exec_all(&mut self, input_bytes: &[u8]) -> Result<(), Error> {
+        for runtime in &mut self.0 {
+            runtime.post_exec(input_bytes)?;
+        }
+        Ok(())
     }
 }
 
@@ -139,7 +275,7 @@ pub enum SkipRange {
 pub struct FridaInstrumentationHelperBuilder {
     stalker_enabled: bool,
     disable_excludes: bool,
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     instrument_module_predicate: Option<Box<dyn FnMut(&ModuleDetails) -> bool>>,
     skip_module_predicate: Box<dyn FnMut(&ModuleDetails) -> bool>,
     skip_ranges: Vec<SkipRange>,
@@ -147,8 +283,36 @@ pub struct FridaInstrumentationHelperBuilder {
 
 impl FridaInstrumentationHelperBuilder {
     /// Create a new [`FridaInstrumentationHelperBuilder`]
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Load a script
+    ///
+    /// See [`Script::new`] for details
+    #[must_use]
+    pub fn load_script<F: Fn(&str, &[u8])>(
+        self,
+        backend: FridaScriptBackend,
+        path: &Path,
+        callback: Option<F>,
+    ) -> Self {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| panic!("Failed to get script file name from path: {path:?}"));
+        let script_prefix = include_str!("script.js");
+        let file_contents = read_to_string(path)
+            .unwrap_or_else(|err| panic!("Failed to read script {path:?}: {err:?}"));
+        let payload = script_prefix.to_string() + &file_contents;
+        let gum = Gum::obtain();
+        let backend = match backend {
+            FridaScriptBackend::V8 => Backend::obtain_v8(&gum),
+            FridaScriptBackend::QuickJS => Backend::obtain_qjs(&gum),
+        };
+        Script::load(&backend, name, payload, callback).unwrap();
+        self
     }
 
     /// Enable or disable the [`Stalker`](https://frida.re/docs/stalker/)
@@ -285,20 +449,23 @@ impl FridaInstrumentationHelperBuilder {
                     module.range().base_address().0 as usize
                 );
                 let range = module.range();
-                let start = range.base_address().0 as usize;
-                ranges
-                    .borrow_mut()
-                    .insert(start..(start + range.size()), (i as u16, module.path()));
+                let start = range.base_address().0 as u64;
+                ranges.borrow_mut().insert(
+                    start..(start + range.size() as u64),
+                    (i as u16, module.path()),
+                );
             }
             for skip in skip_ranges {
                 match skip {
-                    SkipRange::Absolute(range) => ranges.borrow_mut().remove(range),
+                    SkipRange::Absolute(range) => ranges
+                        .borrow_mut()
+                        .remove(range.start as u64..range.end as u64),
                     SkipRange::ModuleRelative { name, range } => {
                         let module_details = ModuleDetails::with_name(name).unwrap();
-                        let lib_start = module_details.range().base_address().0 as usize;
-                        ranges
-                            .borrow_mut()
-                            .remove((lib_start + range.start)..(lib_start + range.end));
+                        let lib_start = module_details.range().base_address().0 as u64;
+                        ranges.borrow_mut().remove(
+                            (lib_start + range.start as u64)..(lib_start + range.end as u64),
+                        );
                     }
                 }
             }
@@ -356,7 +523,7 @@ impl Default for FridaInstrumentationHelperBuilder {
 /// An helper that feeds `FridaInProcessExecutor` with edge-coverage instrumentation
 pub struct FridaInstrumentationHelper<'a, RT: 'a> {
     transformer: Transformer<'a>,
-    ranges: Rc<RefCell<RangeMap<usize, (u16, String)>>>,
+    ranges: Rc<RefCell<RangeMap<u64, (u16, String)>>>,
     runtimes: Rc<RefCell<RT>>,
     stalker_enabled: bool,
     pub(crate) disable_excludes: bool,
@@ -373,17 +540,14 @@ impl<RT> Debug for FridaInstrumentationHelper<'_, RT> {
     }
 }
 
-/// Helper function to get the size of a module's CODE section from frida
-#[must_use]
-pub fn get_module_size(module_name: &str) -> usize {
-    let mut code_size = 0;
-    let code_size_ref = &mut code_size;
-    Module::enumerate_ranges(module_name, PageProtection::ReadExecute, move |details| {
-        *code_size_ref = details.memory_range().size();
-        true
-    });
-
-    code_size
+/// A callback function to test calling back from FRIDA's JavaScript scripting support
+/// # Safety
+/// This function receives a raw pointer to a C string
+#[no_mangle]
+pub unsafe extern "C" fn test_function(message: *const gchar) {
+    if let Ok(msg) = CStr::from_ptr(message).to_str() {
+        println!("{msg}");
+    }
 }
 
 fn pathlist_contains_module<I, P>(list: I, module: &ModuleDetails) -> bool
@@ -404,11 +568,12 @@ where
     })
 }
 
-impl<'a> FridaInstrumentationHelper<'a, ()> {
+impl FridaInstrumentationHelper<'_, ()> {
     /// Create a builder to initialize a [`FridaInstrumentationHelper`].
     ///
     /// See the documentation of [`FridaInstrumentationHelperBuilder`]
     /// for more details.
+    #[must_use]
     pub fn builder() -> FridaInstrumentationHelperBuilder {
         FridaInstrumentationHelperBuilder::default()
     }
@@ -428,7 +593,7 @@ where
             .iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        FridaInstrumentationHelper::builder()
+        let builder = FridaInstrumentationHelper::builder()
             .enable_stalker(options.cmplog || options.asan || !options.disable_coverage)
             .disable_excludes(options.disable_excludes)
             .instrument_module_if(move |module| pathlist_contains_module(&harness, module))
@@ -440,14 +605,27 @@ where
                     name: name.clone(),
                     range: *offset..*offset + 4,
                 }
-            }))
-            .build(gum, runtimes)
+            }));
+
+        let builder = if let Some(script) = &options.script {
+            builder.load_script(
+                options.backend.unwrap_or_default(),
+                script,
+                Some(FridaInstrumentationHelper::<RT>::script_callback),
+            )
+        } else {
+            builder
+        };
+        builder.build(gum, runtimes)
     }
 
-    #[allow(clippy::too_many_lines)]
+    fn script_callback(msg: &str, bytes: &[u8]) {
+        println!("msg: {msg:}, bytes: {bytes:x?}");
+    }
+
     fn build_transformer(
         gum: &'a Gum,
-        ranges: &Rc<RefCell<RangeMap<usize, (u16, String)>>>,
+        ranges: &Rc<RefCell<RangeMap<u64, (u16, String)>>>,
         runtimes: &Rc<RefCell<RT>>,
     ) -> Transformer<'a> {
         let ranges = Rc::clone(ranges);
@@ -464,11 +642,11 @@ where
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn transform(
         basic_block: StalkerIterator,
         output: &StalkerOutput,
-        ranges: &Rc<RefCell<RangeMap<usize, (u16, String)>>>,
+        ranges: &Rc<RefCell<RangeMap<u64, (u16, String)>>>,
         runtimes_unborrowed: &Rc<RefCell<RT>>,
         decoder: InstDecoder,
     ) {
@@ -481,7 +659,7 @@ where
             let address = instr.address();
             // log::trace!("x - block @ {:x} transformed to {:x}", address, output.writer().pc());
             //the ASAN check needs to be done before the hook_rt check due to x86 insns such as call [mem]
-            if ranges.borrow().contains_key(&(address as usize)) {
+            if ranges.borrow().contains_key(&address) {
                 let mut runtimes = (*runtimes_unborrowed).borrow_mut();
                 if first {
                     first = false;
@@ -590,8 +768,8 @@ where
             {
                 log::trace!("{basic_block_start:#016X}:{basic_block_size:X}");
                 rt.drcov_basic_blocks.push(DrCovBasicBlock::new(
-                    basic_block_start as usize,
-                    basic_block_start as usize + basic_block_size,
+                    basic_block_start,
+                    basic_block_start + basic_block_size as u64,
                 ));
             }
         }
@@ -644,6 +822,7 @@ where
     }
 
     /// Returns ref to the Transformer
+    #[must_use]
     pub fn transformer(&self) -> &Transformer<'a> {
         &self.transformer
     }
@@ -652,7 +831,7 @@ where
     pub fn init(
         &mut self,
         gum: &'a Gum,
-        ranges: &RangeMap<usize, (u16, String)>,
+        ranges: &RangeMap<u64, (u16, String)>,
         module_map: &Rc<ModuleMap>,
     ) {
         (*self.runtimes)
@@ -661,16 +840,17 @@ where
     }
 
     /// Method called before execution
-    pub fn pre_exec<I: Input + HasTargetBytes>(&mut self, input: &I) -> Result<(), Error> {
-        (*self.runtimes).borrow_mut().pre_exec_all(input)
+    pub fn pre_exec(&mut self, input_bytes: &[u8]) -> Result<(), Error> {
+        (*self.runtimes).borrow_mut().pre_exec_all(input_bytes)
     }
 
     /// Method called after execution
-    pub fn post_exec<I: Input + HasTargetBytes>(&mut self, input: &I) -> Result<(), Error> {
-        (*self.runtimes).borrow_mut().post_exec_all(input)
+    pub fn post_exec(&mut self, input_bytes: &[u8]) -> Result<(), Error> {
+        (*self.runtimes).borrow_mut().post_exec_all(input_bytes)
     }
 
     /// If stalker is enabled
+    #[must_use]
     pub fn stalker_enabled(&self) -> bool {
         self.stalker_enabled
     }
@@ -684,12 +864,13 @@ where
     }
 
     /// Ranges
-    pub fn ranges(&self) -> Ref<RangeMap<usize, (u16, String)>> {
+    #[must_use]
+    pub fn ranges(&self) -> Ref<RangeMap<u64, (u16, String)>> {
         self.ranges.borrow()
     }
 
     /// Mutable ranges
-    pub fn ranges_mut(&mut self) -> RefMut<RangeMap<usize, (u16, String)>> {
+    pub fn ranges_mut(&mut self) -> RefMut<RangeMap<u64, (u16, String)>> {
         (*self.ranges).borrow_mut()
     }
 }

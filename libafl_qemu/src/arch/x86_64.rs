@@ -1,10 +1,8 @@
-use std::{mem::size_of, sync::OnceLock};
+use std::{mem::size_of, ops::Range, sync::OnceLock};
 
 use capstone::arch::BuildsCapstone;
 use enum_map::{enum_map, EnumMap};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 pub use strum_macros::EnumIter;
 pub use syscall_numbers::x86_64::*;
 
@@ -51,18 +49,10 @@ pub fn get_exit_arch_regs() -> &'static EnumMap<ExitArgs, Regs> {
 }
 
 /// alias registers
-#[allow(non_upper_case_globals)]
+#[expect(non_upper_case_globals)]
 impl Regs {
     pub const Sp: Regs = Regs::Rsp;
     pub const Pc: Regs = Regs::Rip;
-}
-
-#[cfg(feature = "python")]
-impl IntoPy<PyObject> for Regs {
-    fn into_py(self, py: Python) -> PyObject {
-        let n: i32 = self.into();
-        n.into_py(py)
-    }
 }
 
 /// Return an X86 `ArchCapstoneBuilder`
@@ -75,15 +65,14 @@ pub fn capstone() -> capstone::arch::x86::ArchCapstoneBuilder {
 
 pub type GuestReg = u64;
 
+pub const PROCESS_ADDRESS_RANGE: Range<u64> = 0..0x0000_7fff_ffff_ffff;
+
 impl crate::ArchExtras for crate::CPU {
-    fn read_return_address<T>(&self) -> Result<T, QemuRWError>
-    where
-        T: From<GuestReg>,
-    {
+    fn read_return_address(&self) -> Result<GuestReg, QemuRWError> {
         let stack_ptr: GuestReg = self.read_reg(Regs::Rsp)?;
         let mut ret_addr = [0; size_of::<GuestReg>()];
-        unsafe { self.read_mem(stack_ptr, &mut ret_addr) };
-        Ok(GuestReg::from_le_bytes(ret_addr).into())
+        unsafe { self.read_mem_unchecked(stack_ptr, &mut ret_addr) };
+        Ok(GuestReg::from_le_bytes(ret_addr))
     }
 
     fn write_return_address<T>(&self, val: T) -> Result<(), QemuRWError>
@@ -93,14 +82,15 @@ impl crate::ArchExtras for crate::CPU {
         let stack_ptr: GuestReg = self.read_reg(Regs::Rsp)?;
         let val: GuestReg = val.into();
         let ret_addr = val.to_le_bytes();
-        unsafe { self.write_mem(stack_ptr, &ret_addr) };
+        unsafe { self.write_mem_unchecked(stack_ptr, &ret_addr) };
         Ok(())
     }
 
-    fn read_function_argument<T>(&self, conv: CallingConvention, idx: u8) -> Result<T, QemuRWError>
-    where
-        T: From<GuestReg>,
-    {
+    fn read_function_argument(
+        &self,
+        conv: CallingConvention,
+        idx: u8,
+    ) -> Result<GuestReg, QemuRWError> {
         QemuRWError::check_conv(QemuRWErrorKind::Read, CallingConvention::Cdecl, conv)?;
 
         let reg_id = match idx {

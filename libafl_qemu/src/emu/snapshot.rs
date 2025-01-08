@@ -6,6 +6,8 @@ use std::{
 use crate::Qemu;
 
 pub trait IsSnapshotManager: Clone + Debug {
+    fn init(&mut self, _qemu: Qemu) {}
+
     fn save(&mut self, qemu: Qemu) -> SnapshotId;
     fn restore(&mut self, qemu: Qemu, snapshot_id: &SnapshotId)
         -> Result<(), SnapshotManagerError>;
@@ -60,6 +62,7 @@ impl Default for NopSnapshotManager {
 
 impl IsSnapshotManager for NopSnapshotManager {
     fn save(&mut self, _qemu: Qemu) -> SnapshotId {
+        log::warn!("Saving snapshot with the NopSnapshotManager");
         SnapshotId { id: 0 }
     }
 
@@ -68,6 +71,7 @@ impl IsSnapshotManager for NopSnapshotManager {
         _qemu: Qemu,
         _snapshot_id: &SnapshotId,
     ) -> Result<(), SnapshotManagerError> {
+        log::warn!("Restoring snapshot with the NopSnapshotManager");
         Ok(())
     }
 

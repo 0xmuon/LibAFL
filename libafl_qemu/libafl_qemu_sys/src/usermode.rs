@@ -1,22 +1,18 @@
+#[cfg(target_os = "linux")]
 use core::{slice::from_raw_parts, str::from_utf8_unchecked};
+#[cfg(feature = "python")]
+use std::convert::Infallible;
 
+#[cfg(target_os = "linux")]
 use libc::{c_char, strlen};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use paste::paste;
 #[cfg(feature = "python")]
-use pyo3::{pyclass, pymethods, IntoPy, PyObject, Python};
+use pyo3::{pyclass, pymethods, types::PyInt, Bound, IntoPyObject, Python};
 use strum_macros::EnumIter;
 
-use crate::{extern_c_checked, libafl_mapinfo, GuestAddr, MmapPerms};
-
-extern_c_checked! {
-    pub static exec_path: *const u8;
-    pub static guest_base: usize;
-    pub static mut mmap_next_start: GuestAddr;
-
-    pub static mut libafl_dump_core_hook: unsafe extern "C" fn(i32);
-    pub static mut libafl_force_dfl: i32;
-}
+use crate::MmapPerms;
+#[cfg(target_os = "linux")]
+use crate::{libafl_mapinfo, GuestAddr};
 
 #[derive(IntoPrimitive, TryFromPrimitive, Debug, Clone, Copy, EnumIter, PartialEq, Eq)]
 #[repr(i32)]
@@ -108,12 +104,18 @@ impl MmapPerms {
 }
 
 #[cfg(feature = "python")]
-impl IntoPy<PyObject> for MmapPerms {
-    fn into_py(self, py: Python) -> PyObject {
+impl<'py> IntoPyObject<'py> for MmapPerms {
+    type Target = PyInt;
+    type Output = Bound<'py, Self::Target>;
+    type Error = Infallible;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let n: i32 = self.into();
-        n.into_py(py)
+        n.into_pyobject(py)
     }
 }
+
+#[cfg(target_os = "linux")]
 impl From<libafl_mapinfo> for MapInfo {
     fn from(map_info: libafl_mapinfo) -> Self {
         let path: Option<String> = if map_info.path.is_null() {

@@ -1,6 +1,9 @@
 //! Mutator definitions for [`MultipartInput`]s. See [`crate::inputs::multi`] for details.
 
-use core::cmp::{min, Ordering};
+use core::{
+    cmp::{min, Ordering},
+    num::NonZero,
+};
 
 use libafl_bolts::{rands::Rand, Error};
 
@@ -41,13 +44,12 @@ where
         state: &mut S,
         input: &mut MultipartInput<I>,
     ) -> Result<MutationResult, Error> {
-        if input.parts().is_empty() {
-            Ok(MutationResult::Skipped)
-        } else {
-            let selected = state.rand_mut().below(input.parts().len());
-            let mutated = input.part_mut(selected).unwrap();
-            self.mutate(state, mutated)
-        }
+        let Some(parts_len) = NonZero::new(input.parts().len()) else {
+            return Ok(MutationResult::Skipped);
+        };
+        let selected = state.rand_mut().below(parts_len);
+        let mutated = input.part_mut(selected).unwrap();
+        self.mutate(state, mutated)
     }
 
     fn post_exec(&mut self, state: &mut S, new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
@@ -114,10 +116,11 @@ impl_default_multipart!(
     I2SRandReplace,
 );
 
-impl<I, S> Mutator<MultipartInput<I>, S> for CrossoverInsertMutator<I>
+impl<I, S> Mutator<MultipartInput<I>, S> for CrossoverInsertMutator
 where
-    S: HasCorpus<Input = MultipartInput<I>> + HasMaxSize + HasRand,
+    S: HasCorpus + HasMaxSize + HasRand,
     I: Input + HasMutatorBytes,
+    S::Corpus: Corpus<Input = MultipartInput<I>>,
 {
     fn mutate(
         &mut self,
@@ -132,6 +135,9 @@ where
         let id = random_corpus_id!(state.corpus(), state.rand_mut());
         if let Some(cur) = state.corpus().current() {
             if id == *cur {
+                if input.names().is_empty() {
+                    return Ok(MutationResult::Skipped);
+                }
                 let choice = name_choice % input.names().len();
                 let name = input.names()[choice].clone();
 
@@ -153,8 +159,17 @@ where
                     .map(|(id, part)| (id, part.bytes().len()));
 
                 if let Some((part_idx, size)) = maybe_size {
-                    let target = state.rand_mut().below(size);
-                    let range = rand_range(state, other_size, min(other_size, size - target));
+                    let Some(nz) = NonZero::new(size) else {
+                        return Ok(MutationResult::Skipped);
+                    };
+                    let target = state.rand_mut().below(nz);
+                    // # Safety
+                    // size is nonzero here (checked above), target is smaller than size
+                    // -> the subtraction result is greater than 0.
+                    // other_size is checked above to be larger than zero.
+                    let range = rand_range(state, other_size, unsafe {
+                        NonZero::new(min(other_size, size - target)).unwrap_unchecked()
+                    });
 
                     let [part, chosen] = match part_idx.cmp(&choice) {
                         Ordering::Less => input.parts_mut([part_idx, choice]),
@@ -167,7 +182,13 @@ where
                         }
                     };
 
-                    return Ok(Self::crossover_insert(part, size, target, range, chosen));
+                    return Ok(Self::crossover_insert(
+                        part,
+                        size,
+                        target,
+                        range,
+                        chosen.bytes(),
+                    ));
                 }
 
                 return Ok(MutationResult::Skipped);
@@ -176,6 +197,10 @@ where
 
         let mut other_testcase = state.corpus().get(id)?.borrow_mut();
         let other = other_testcase.load_input(state.corpus())?;
+
+        if other.names().is_empty() {
+            return Ok(MutationResult::Skipped);
+        }
 
         let choice = name_choice % other.names().len();
         let name = &other.names()[choice];
@@ -194,9 +219,18 @@ where
                 .unwrap();
             drop(other_testcase);
             let size = part.bytes().len();
+            let Some(nz) = NonZero::new(size) else {
+                return Ok(MutationResult::Skipped);
+            };
 
-            let target = state.rand_mut().below(size);
-            let range = rand_range(state, other_size, min(other_size, size - target));
+            let target = state.rand_mut().below(nz);
+            // # Safety
+            // other_size is larger than 0, checked above.
+            // size is larger than 0.
+            // target is smaller than size -> the subtraction is larger than 0.
+            let range = rand_range(state, other_size, unsafe {
+                NonZero::new(min(other_size, size - target)).unwrap_unchecked()
+            });
 
             let other_testcase = state.corpus().get(id)?.borrow_mut();
             // No need to load the input again, it'll still be cached.
@@ -207,7 +241,7 @@ where
                 size,
                 target,
                 range,
-                &other.parts()[choice],
+                other.parts()[choice].bytes(),
             ))
         } else {
             // just add it!
@@ -218,10 +252,11 @@ where
     }
 }
 
-impl<I, S> Mutator<MultipartInput<I>, S> for CrossoverReplaceMutator<I>
+impl<I, S> Mutator<MultipartInput<I>, S> for CrossoverReplaceMutator
 where
-    S: HasCorpus<Input = MultipartInput<I>> + HasMaxSize + HasRand,
+    S: HasCorpus + HasMaxSize + HasRand,
     I: Input + HasMutatorBytes,
+    S::Corpus: Corpus<Input = MultipartInput<I>>,
 {
     fn mutate(
         &mut self,
@@ -236,6 +271,9 @@ where
         let id = random_corpus_id!(state.corpus(), state.rand_mut());
         if let Some(cur) = state.corpus().current() {
             if id == *cur {
+                if input.names().is_empty() {
+                    return Ok(MutationResult::Skipped);
+                }
                 let choice = name_choice % input.names().len();
                 let name = input.names()[choice].clone();
 
@@ -257,8 +295,17 @@ where
                     .map(|(id, part)| (id, part.bytes().len()));
 
                 if let Some((part_idx, size)) = maybe_size {
-                    let target = state.rand_mut().below(size);
-                    let range = rand_range(state, other_size, min(other_size, size - target));
+                    let Some(nz) = NonZero::new(size) else {
+                        return Ok(MutationResult::Skipped);
+                    };
+
+                    let target = state.rand_mut().below(nz);
+                    // # Safety
+                    // other_size is checked above.
+                    // size is larger than than target and larger than 1. The subtraction result will always be positive.
+                    let range = rand_range(state, other_size, unsafe {
+                        NonZero::new(min(other_size, size - target)).unwrap_unchecked()
+                    });
 
                     let [part, chosen] = match part_idx.cmp(&choice) {
                         Ordering::Less => input.parts_mut([part_idx, choice]),
@@ -271,7 +318,7 @@ where
                         }
                     };
 
-                    return Ok(Self::crossover_replace(part, target, range, chosen));
+                    return Ok(Self::crossover_replace(part, target, range, chosen.bytes()));
                 }
 
                 return Ok(MutationResult::Skipped);
@@ -280,6 +327,10 @@ where
 
         let mut other_testcase = state.corpus().get(id)?.borrow_mut();
         let other = other_testcase.load_input(state.corpus())?;
+
+        if other.names().is_empty() {
+            return Ok(MutationResult::Skipped);
+        }
 
         let choice = name_choice % other.names().len();
         let name = &other.names()[choice];
@@ -298,9 +349,17 @@ where
                 .unwrap();
             drop(other_testcase);
             let size = part.bytes().len();
+            let Some(nz) = NonZero::new(size) else {
+                return Ok(MutationResult::Skipped);
+            };
 
-            let target = state.rand_mut().below(size);
-            let range = rand_range(state, other_size, min(other_size, size - target));
+            let target = state.rand_mut().below(nz);
+            // # Safety
+            // other_size is checked above.
+            // size is larger than than target and larger than 1. The subtraction result will always be positive.
+            let range = rand_range(state, other_size, unsafe {
+                NonZero::new(min(other_size, size - target)).unwrap_unchecked()
+            });
 
             let other_testcase = state.corpus().get(id)?.borrow_mut();
             // No need to load the input again, it'll still be cached.
@@ -310,7 +369,7 @@ where
                 part,
                 target,
                 range,
-                &other.parts()[choice],
+                other.parts()[choice].bytes(),
             ))
         } else {
             // just add it!

@@ -1,12 +1,12 @@
 [package]
 name = "baby_fuzzer_swap_differential"
-version = "0.13.2"
+version = "0.14.1"
 authors = ["Addison Crump <research@addisoncrump.info>"]
 edition = "2021"
 default-run = "fuzzer_sd"
 
 [features]
-tui = []
+tui = ["libafl/tui_monitor"]
 multimap = []
 
 [profile.dev]
@@ -20,12 +20,12 @@ opt-level = 3
 debug = true
 
 [build-dependencies]
-anyhow = "1"
-bindgen = "0.69.4"
-cc = "1.0"
+anyhow = "1.0.89"
+bindgen = "0.70.1"
+cc = "1.1.21"
 
 [dependencies]
-libafl = { path = "../../../libafl" }
+libafl = { path = "../../../libafl", features = ["tui_monitor"] }
 libafl_bolts = { path = "../../../libafl_bolts" }
 libafl_targets = { path = "../../../libafl_targets", features = [
   "sancov_pcguard_hitcounts",
@@ -33,9 +33,10 @@ libafl_targets = { path = "../../../libafl_targets", features = [
   "sancov_cmplog",
   "pointer_maps",
 ] }
-mimalloc = { version = "*", default-features = false }
+log = { version = "0.4.22", features = ["release_max_level_info"] }
+mimalloc = { version = "0.1.43", default-features = false }
 
-libafl_cc = { path = "../../../libafl_cc/" }
+libafl_cc = { path = "../../../libafl_cc" }
 
 [[bin]]
 name = "fuzzer_sd"

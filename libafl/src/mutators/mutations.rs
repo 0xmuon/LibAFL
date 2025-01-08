@@ -4,7 +4,13 @@ use alloc::{
     borrow::{Cow, ToOwned},
     vec::Vec,
 };
-use core::{cmp::min, marker::PhantomData, mem::size_of, ops::Range};
+use core::{
+    cmp::min,
+    marker::PhantomData,
+    mem::size_of,
+    num::{NonZero, NonZeroUsize},
+    ops::Range,
+};
 
 use libafl_bolts::{rands::Rand, Named};
 
@@ -12,7 +18,7 @@ use crate::{
     corpus::Corpus,
     inputs::HasMutatorBytes,
     mutators::{MutationResult, Mutator},
-    random_corpus_id_with_disabled,
+    nonzero, random_corpus_id_with_disabled,
     state::{HasCorpus, HasMaxSize, HasRand},
     Error,
 };
@@ -64,10 +70,10 @@ pub fn buffer_set<T: Clone>(data: &mut [T], from: usize, len: usize, val: T) {
 ///
 /// This problem corresponds to: <https://oeis.org/A059036>
 #[inline]
-pub fn rand_range<S: HasRand>(state: &mut S, upper: usize, max_len: usize) -> Range<usize> {
+pub fn rand_range<S: HasRand>(state: &mut S, upper: usize, max_len: NonZeroUsize) -> Range<usize> {
     let len = 1 + state.rand_mut().below(max_len);
     // sample from [1..upper + len]
-    let mut offset2 = 1 + state.rand_mut().below(upper + len - 1);
+    let mut offset2 = 1 + state.rand_mut().zero_upto(upper + len - 1);
     let offset1 = offset2.saturating_sub(len);
     if offset2 > upper {
         offset2 = upper;
@@ -305,7 +311,7 @@ where
             Ok(MutationResult::Skipped)
         } else {
             let byte = state.rand_mut().choose(input.bytes_mut()).unwrap();
-            *byte ^= 1 + state.rand_mut().below(254) as u8;
+            *byte ^= 1 + state.rand_mut().below(nonzero!(254)) as u8;
             Ok(MutationResult::Mutated)
         }
     }
@@ -334,7 +340,7 @@ macro_rules! add_mutator_impl {
         #[derive(Default, Debug)]
         pub struct $name;
 
-        #[allow(trivial_numeric_casts)]
+        #[allow(trivial_numeric_casts)] // only for some calls of the macro
         impl<I, S> Mutator<I, S> for $name
         where
             S: HasRand,
@@ -356,8 +362,8 @@ macro_rules! add_mutator_impl {
                     let val = <$size>::from_ne_bytes(bytes.try_into().unwrap());
 
                     // mutate
-                    let num = 1 + state.rand_mut().below(ARITH_MAX) as $size;
-                    let new_val = match state.rand_mut().below(4) {
+                    let num = 1 + state.rand_mut().below(nonzero!(ARITH_MAX)) as $size;
+                    let new_val = match state.rand_mut().below(nonzero!(4)) {
                         0 => val.wrapping_add(num),
                         1 => val.wrapping_sub(num),
                         2 => val.swap_bytes().wrapping_add(num).swap_bytes(),
@@ -407,14 +413,18 @@ macro_rules! interesting_mutator_impl {
             S: HasRand,
             I: HasMutatorBytes,
         {
-            #[allow(clippy::cast_sign_loss)]
+            #[expect(clippy::cast_sign_loss)]
             fn mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error> {
                 if input.bytes().len() < size_of::<$size>() {
                     Ok(MutationResult::Skipped)
                 } else {
                     let bytes = input.bytes_mut();
                     let upper_bound = (bytes.len() + 1 - size_of::<$size>());
-                    let idx = state.rand_mut().below(upper_bound);
+                    // # Safety
+                    // the length is at least as large as the size here (checked above), and we add a 1 -> never zero.
+                    let idx = state
+                        .rand_mut()
+                        .below(unsafe { NonZero::new(upper_bound).unwrap_unchecked() });
                     let val = *state.rand_mut().choose(&$interesting).unwrap() as $size;
                     let new_bytes = match state.rand_mut().choose(&[0, 1]).unwrap() {
                         0 => val.to_be_bytes(),
@@ -462,7 +472,11 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let range = rand_range(state, size, size - 1);
+        // # Safety
+        // size - 1 is guaranteed to be larger than 0 because we abort on size <= 2 above.
+        let range = rand_range(state, size, unsafe {
+            NonZero::new(size - 1).unwrap_unchecked()
+        });
 
         input.drain(range);
 
@@ -501,7 +515,11 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let range = rand_range(state, size, min(16, max_size - size));
+        // # Safety
+        // max_size - size is larger than 0 because we check that size < max_size above
+        let range = rand_range(state, size, unsafe {
+            NonZero::new(min(16, max_size - size)).unwrap_unchecked()
+        });
 
         input.resize(size + range.len(), 0);
         unsafe {
@@ -548,8 +566,13 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let mut amount = 1 + state.rand_mut().below(16);
-        let offset = state.rand_mut().below(size + 1);
+        let mut amount = 1 + state.rand_mut().below(nonzero!(16));
+        // # Safety
+        // It's a safe assumption that size + 1 is never 0.
+        // If we wrap around we have _a lot_ of elements - and the code will break later anyway.
+        let offset = state
+            .rand_mut()
+            .below(unsafe { NonZero::new(size + 1).unwrap_unchecked() });
 
         if size + amount > max_size {
             if max_size > size {
@@ -559,7 +582,11 @@ where
             }
         }
 
-        let val = input.bytes()[state.rand_mut().below(size)];
+        // # Safety
+        // size is larger than 0, checked above.
+        let val = input.bytes()[state
+            .rand_mut()
+            .below(unsafe { NonZero::new(size).unwrap_unchecked() })];
 
         input.resize(size + amount, 0);
         unsafe {
@@ -602,8 +629,12 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let mut amount = 1 + state.rand_mut().below(16);
-        let offset = state.rand_mut().below(size + 1);
+        let mut amount = 1 + state.rand_mut().below(nonzero!(16));
+        // # Safety
+        // size + 1 can never be 0
+        let offset = state
+            .rand_mut()
+            .below(unsafe { NonZero::new(size.wrapping_add(1)).unwrap_unchecked() });
 
         if size + amount > max_size {
             if max_size > size {
@@ -654,7 +685,11 @@ where
         if size == 0 {
             return Ok(MutationResult::Skipped);
         }
-        let range = rand_range(state, size, min(size, 16));
+        // # Safety
+        // Size is larger than 0, checked above (and 16 is also lager than 0 FWIW)
+        let range = rand_range(state, size, unsafe {
+            NonZero::new(min(size, 16)).unwrap_unchecked()
+        });
 
         let val = *state.rand_mut().choose(input.bytes()).unwrap();
         let quantity = range.len();
@@ -693,7 +728,11 @@ where
         if size == 0 {
             return Ok(MutationResult::Skipped);
         }
-        let range = rand_range(state, size, min(size, 16));
+        // # Safety
+        // Size is larger than 0, checked above. 16 is larger than 0, according to my math teacher.
+        let range = rand_range(state, size, unsafe {
+            NonZero::new(min(size, 16)).unwrap_unchecked()
+        });
 
         let val = state.rand_mut().next() as u8;
         let quantity = range.len();
@@ -733,8 +772,16 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let target = state.rand_mut().below(size);
-        let range = rand_range(state, size, size - target);
+        // # Safety
+        // size is always larger than 0 here (checked above)
+        let target = state
+            .rand_mut()
+            .below(unsafe { NonZero::new(size).unwrap_unchecked() });
+        // # Safety
+        // target is smaller than size (`below` is exclusive) -> The subtraction is always larger than 0
+        let range = rand_range(state, size, unsafe {
+            NonZero::new(size - target).unwrap_unchecked()
+        });
 
         unsafe {
             buffer_self_copy(input.bytes_mut(), range.start, target, range.len());
@@ -776,10 +823,20 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let target = state.rand_mut().below(size);
+        // # Safety
+        // We checked that size is larger than 0 above.
+        let target = state
+            .rand_mut()
+            .below(unsafe { NonZero::new(size).unwrap_unchecked() });
         // make sure that the sampled range is both in bounds and of an acceptable size
         let max_insert_len = min(size - target, state.max_size() - size);
-        let range = rand_range(state, size, min(16, max_insert_len));
+        let max_insert_len = min(16, max_insert_len);
+
+        // # Safety
+        // size > target and state.max_size() > size
+        let max_insert_len = unsafe { NonZero::new(max_insert_len).unwrap_unchecked() };
+
+        let range = rand_range(state, size, max_insert_len);
 
         input.resize(size + range.len(), 0);
         self.tmp_buf.resize(range.len(), 0);
@@ -825,7 +882,7 @@ pub struct BytesSwapMutator {
     tmp_buf: Vec<u8>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 impl<I, S> Mutator<I, S> for BytesSwapMutator
 where
     S: HasRand,
@@ -837,11 +894,19 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let first = rand_range(state, size, size);
+        // # Safety
+        // size is larger than 0, checked above.
+        let first = rand_range(state, size, unsafe {
+            NonZero::new(size).unwrap_unchecked()
+        });
         if state.rand_mut().next() & 1 == 0 && first.start != 0 {
             // The second range comes before first.
 
-            let second = rand_range(state, first.start, first.start);
+            // # Safety
+            // first.start is larger than 0, checked above.
+            let second = rand_range(state, first.start, unsafe {
+                NonZero::new(first.start).unwrap_unchecked()
+            });
             self.tmp_buf.resize(first.len(), 0);
             unsafe {
                 // If range first is larger
@@ -921,8 +986,11 @@ where
             }
             Ok(MutationResult::Mutated)
         } else if first.end != size {
-            // The first range comes before the second range
-            let mut second = rand_range(state, size - first.end, size - first.end);
+            // # Safety
+            // first.end is not equal to size, so subtracting them can never be 0.
+            let mut second = rand_range(state, size - first.end, unsafe {
+                NonZero::new(size - first.end).unwrap_unchecked()
+            });
             second.start += first.end;
             second.end += first.end;
 
@@ -1025,18 +1093,19 @@ impl BytesSwapMutator {
 
 /// Crossover insert mutation for inputs with a bytes vector
 #[derive(Debug, Default)]
-pub struct CrossoverInsertMutator<I> {
-    phantom: PhantomData<I>,
-}
+pub struct CrossoverInsertMutator;
 
-impl<I: HasMutatorBytes> CrossoverInsertMutator<I> {
-    pub(crate) fn crossover_insert<I2: HasMutatorBytes>(
+impl CrossoverInsertMutator {
+    pub(crate) fn crossover_insert<I>(
         input: &mut I,
         size: usize,
         target: usize,
         range: Range<usize>,
-        other: &I2,
-    ) -> MutationResult {
+        other: &[u8],
+    ) -> MutationResult
+    where
+        I: HasMutatorBytes,
+    {
         input.resize(size + range.len(), 0);
         unsafe {
             buffer_self_copy(
@@ -1048,26 +1117,24 @@ impl<I: HasMutatorBytes> CrossoverInsertMutator<I> {
         }
 
         unsafe {
-            buffer_copy(
-                input.bytes_mut(),
-                other.bytes(),
-                range.start,
-                target,
-                range.len(),
-            );
+            buffer_copy(input.bytes_mut(), other, range.start, target, range.len());
         }
         MutationResult::Mutated
     }
 }
 
-impl<I, S> Mutator<I, S> for CrossoverInsertMutator<I>
+impl<I, S> Mutator<I, S> for CrossoverInsertMutator
 where
     S: HasCorpus + HasRand + HasMaxSize,
-    S::Input: HasMutatorBytes,
+    <S::Corpus as Corpus>::Input: HasMutatorBytes,
     I: HasMutatorBytes,
 {
     fn mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error> {
         let size = input.bytes().len();
+        let Some(nonzero_size) = NonZero::new(size) else {
+            return Ok(MutationResult::Skipped);
+        };
+
         let max_size = state.max_size();
         if size >= max_size {
             return Ok(MutationResult::Skipped);
@@ -1090,64 +1157,68 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let range = rand_range(state, other_size, min(other_size, max_size - size));
-        let target = state.rand_mut().below(size); // TODO: fix bug if size is 0
+        // # Safety
+        // other_size is checked above.
+        // size is smaller than max_size (also checked above) -> the subtraction result is larger than 0.
+        let range = rand_range(state, other_size, unsafe {
+            NonZero::new(min(other_size, max_size - size)).unwrap_unchecked()
+        });
+        let target = state.rand_mut().below(nonzero_size);
 
         let other_testcase = state.corpus().get_from_all(id)?.borrow_mut();
         // No need to load the input again, it'll still be cached.
         let other = other_testcase.input().as_ref().unwrap();
 
-        Ok(Self::crossover_insert(input, size, target, range, other))
+        Ok(Self::crossover_insert(
+            input,
+            size,
+            target,
+            range,
+            other.bytes(),
+        ))
     }
 }
 
-impl<I> Named for CrossoverInsertMutator<I> {
+impl Named for CrossoverInsertMutator {
     fn name(&self) -> &Cow<'static, str> {
         static NAME: Cow<'static, str> = Cow::Borrowed("CrossoverInsertMutator");
         &NAME
     }
 }
 
-impl<I> CrossoverInsertMutator<I> {
+impl CrossoverInsertMutator {
     /// Creates a new [`CrossoverInsertMutator`].
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
+        Self {}
     }
 }
 
 /// Crossover replace mutation for inputs with a bytes vector
 #[derive(Debug, Default)]
-pub struct CrossoverReplaceMutator<I> {
-    phantom: PhantomData<I>,
-}
+pub struct CrossoverReplaceMutator;
 
-impl<I: HasMutatorBytes> CrossoverReplaceMutator<I> {
-    pub(crate) fn crossover_replace<I2: HasMutatorBytes>(
+impl CrossoverReplaceMutator {
+    pub(crate) fn crossover_replace<I>(
         input: &mut I,
         target: usize,
         range: Range<usize>,
-        other: &I2,
-    ) -> MutationResult {
+        other: &[u8],
+    ) -> MutationResult
+    where
+        I: HasMutatorBytes,
+    {
         unsafe {
-            buffer_copy(
-                input.bytes_mut(),
-                other.bytes(),
-                range.start,
-                target,
-                range.len(),
-            );
+            buffer_copy(input.bytes_mut(), other, range.start, target, range.len());
         }
         MutationResult::Mutated
     }
 }
 
-impl<I, S> Mutator<I, S> for CrossoverReplaceMutator<I>
+impl<I, S> Mutator<I, S> for CrossoverReplaceMutator
 where
     S: HasCorpus + HasRand,
-    S::Input: HasMutatorBytes,
+    <S::Corpus as Corpus>::Input: HasMutatorBytes,
     I: HasMutatorBytes,
 {
     fn mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error> {
@@ -1173,31 +1244,229 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let target = state.rand_mut().below(size);
-        let range = rand_range(state, other_size, min(other_size, size - target));
+        // # Safety
+        // Size is > 0 here (checked above)
+        let target = state
+            .rand_mut()
+            .below(unsafe { NonZero::new(size).unwrap_unchecked() });
+        // # Safety
+        // other_size is checked above.
+        // target is smaller than size (since below is exclusive) -> the subtraction result is larger than 0.
+        let range = rand_range(state, other_size, unsafe {
+            NonZero::new(min(other_size, size - target)).unwrap_unchecked()
+        });
 
         let other_testcase = state.corpus().get_from_all(id)?.borrow_mut();
         // No need to load the input again, it'll still be cached.
         let other = other_testcase.input().as_ref().unwrap();
 
-        Ok(Self::crossover_replace(input, target, range, other))
+        Ok(Self::crossover_replace(input, target, range, other.bytes()))
     }
 }
 
-impl<I> Named for CrossoverReplaceMutator<I> {
+impl Named for CrossoverReplaceMutator {
     fn name(&self) -> &Cow<'static, str> {
         static NAME: Cow<'static, str> = Cow::Borrowed("CrossoverReplaceMutator");
         &NAME
     }
 }
 
-impl<I> CrossoverReplaceMutator<I> {
+impl CrossoverReplaceMutator {
     /// Creates a new [`CrossoverReplaceMutator`].
     #[must_use]
     pub fn new() -> Self {
+        Self {}
+    }
+}
+
+trait IntoOptionBytes {
+    fn map_to_option_bytes(&self) -> Option<&Vec<u8>>;
+}
+
+impl IntoOptionBytes for Vec<u8> {
+    fn map_to_option_bytes(&self) -> Option<&Vec<u8>> {
+        Some(self)
+    }
+}
+
+impl IntoOptionBytes for Option<Vec<u8>> {
+    fn map_to_option_bytes(&self) -> Option<&Vec<u8>> {
+        self.as_ref()
+    }
+}
+
+/// Crossover insert mutation for inputs mapped to a bytes vector
+#[derive(Debug)]
+pub struct MappedCrossoverInsertMutator<F, O> {
+    input_mapper: F,
+    phantom: PhantomData<O>,
+}
+
+impl<F, O> MappedCrossoverInsertMutator<F, O> {
+    /// Creates a new [`MappedCrossoverInsertMutator`]
+    pub fn new(input_mapper: F) -> Self {
         Self {
+            input_mapper,
             phantom: PhantomData,
         }
+    }
+}
+
+impl<S, F, I, O> Mutator<I, S> for MappedCrossoverInsertMutator<F, O>
+where
+    S: HasCorpus + HasMaxSize + HasRand,
+    I: HasMutatorBytes,
+    O: IntoOptionBytes,
+    F: Fn(&<S::Corpus as Corpus>::Input) -> &O,
+{
+    fn mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error> {
+        let size = input.bytes().len();
+        let max_size = state.max_size();
+        // TODO: fix bug if size is 0 (?)
+        if size >= max_size || size == 0 {
+            return Ok(MutationResult::Skipped);
+        }
+
+        let id = random_corpus_id_with_disabled!(state.corpus(), state.rand_mut());
+        // We don't want to use the testcase we're already using for splicing
+        if let Some(cur) = state.corpus().current() {
+            if id == *cur {
+                return Ok(MutationResult::Skipped);
+            }
+        }
+
+        let other_size = {
+            let mut other_testcase = state.corpus().get_from_all(id)?.borrow_mut();
+            let other_input = other_testcase.load_input(state.corpus())?;
+            let input_mapped = (self.input_mapper)(other_input).map_to_option_bytes();
+            input_mapped.map_or(0, <Vec<u8>>::len)
+        };
+
+        if other_size < 2 {
+            return Ok(MutationResult::Skipped);
+        }
+
+        // # Safety
+        // other_size is checked to be larger than 0
+        // max_size is checked to be larger than size, so the subtraction will always be positive and non-0
+        let range = rand_range(state, other_size, unsafe {
+            NonZero::new(min(other_size, max_size - size)).unwrap_unchecked()
+        });
+        // # Safety
+        // size is checked above to never be 0.
+        let target = state
+            .rand_mut()
+            .below(unsafe { NonZero::new(size).unwrap_unchecked() });
+
+        let other_testcase = state.corpus().get_from_all(id)?.borrow_mut();
+        // No need to load the input again, it'll still be cached.
+        let other_input = &mut other_testcase.input().as_ref().unwrap();
+        let wrapped_mapped_other_input = (self.input_mapper)(other_input).map_to_option_bytes();
+        if wrapped_mapped_other_input.is_none() {
+            return Ok(MutationResult::Skipped);
+        }
+        let mapped_other_input = wrapped_mapped_other_input.unwrap();
+
+        Ok(CrossoverInsertMutator::crossover_insert(
+            input,
+            size,
+            target,
+            range,
+            mapped_other_input,
+        ))
+    }
+}
+
+impl<F, O> Named for MappedCrossoverInsertMutator<F, O> {
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("MappedCrossoverInsertMutator");
+        &NAME
+    }
+}
+
+/// Crossover replace mutation for inputs mapped to a bytes vector
+#[derive(Debug)]
+pub struct MappedCrossoverReplaceMutator<F, O> {
+    input_mapper: F,
+    phantom: PhantomData<O>,
+}
+
+impl<F, O> MappedCrossoverReplaceMutator<F, O> {
+    /// Creates a new [`MappedCrossoverReplaceMutator`]
+    pub fn new(input_mapper: F) -> Self {
+        Self {
+            input_mapper,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<S, F, I, O> Mutator<I, S> for MappedCrossoverReplaceMutator<F, O>
+where
+    S: HasCorpus + HasMaxSize + HasRand,
+    I: HasMutatorBytes,
+    O: IntoOptionBytes,
+    F: Fn(&<S::Corpus as Corpus>::Input) -> &O,
+{
+    fn mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error> {
+        let size = input.bytes().len();
+        if size == 0 {
+            return Ok(MutationResult::Skipped);
+        }
+
+        let id = random_corpus_id_with_disabled!(state.corpus(), state.rand_mut());
+        // We don't want to use the testcase we're already using for splicing
+        if let Some(cur) = state.corpus().current() {
+            if id == *cur {
+                return Ok(MutationResult::Skipped);
+            }
+        }
+
+        let other_size = {
+            let mut other_testcase = state.corpus().get_from_all(id)?.borrow_mut();
+            let other_input = other_testcase.load_input(state.corpus())?;
+            let input_mapped = (self.input_mapper)(other_input).map_to_option_bytes();
+            input_mapped.map_or(0, <Vec<u8>>::len)
+        };
+
+        if other_size < 2 {
+            return Ok(MutationResult::Skipped);
+        }
+
+        // # Safety
+        // We checked for size == 0 above.
+        let target = state
+            .rand_mut()
+            .below(unsafe { NonZero::new(size).unwrap_unchecked() });
+        // # Safety
+        // other_size is checked above to not be 0.
+        // size is larger than target since below is exclusive -> subtraction is always non-0.
+        let range = rand_range(state, other_size, unsafe {
+            NonZero::new(min(other_size, size - target)).unwrap_unchecked()
+        });
+
+        let other_testcase = state.corpus().get_from_all(id)?.borrow_mut();
+        // No need to load the input again, it'll still be cached.
+        let other_input = &mut other_testcase.input().as_ref().unwrap();
+        let wrapped_mapped_other_input = (self.input_mapper)(other_input).map_to_option_bytes();
+        if wrapped_mapped_other_input.is_none() {
+            return Ok(MutationResult::Skipped);
+        }
+        let mapped_other_input = wrapped_mapped_other_input.unwrap();
+
+        Ok(CrossoverReplaceMutator::crossover_replace(
+            input,
+            target,
+            range,
+            mapped_other_input,
+        ))
+    }
+}
+
+impl<F, O> Named for MappedCrossoverReplaceMutator<F, O> {
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("MappedCrossoverReplaceMutator");
+        &NAME
     }
 }
 
@@ -1206,7 +1475,6 @@ fn locate_diffs(this: &[u8], other: &[u8]) -> (i64, i64) {
     let mut first_diff: i64 = -1;
     let mut last_diff: i64 = -1;
     for (i, (this_el, other_el)) in this.iter().zip(other.iter()).enumerate() {
-        #[allow(clippy::cast_possible_wrap)]
         if this_el != other_el {
             if first_diff < 0 {
                 first_diff = i64::try_from(i).unwrap();
@@ -1222,13 +1490,14 @@ fn locate_diffs(this: &[u8], other: &[u8]) -> (i64, i64) {
 #[derive(Debug, Default)]
 pub struct SpliceMutator;
 
-impl<S> Mutator<S::Input, S> for SpliceMutator
+impl<I, S> Mutator<I, S> for SpliceMutator
 where
     S: HasCorpus + HasRand,
-    S::Input: HasMutatorBytes,
+    <S::Corpus as Corpus>::Input: HasMutatorBytes,
+    I: HasMutatorBytes,
 {
-    #[allow(clippy::cast_sign_loss)]
-    fn mutate(&mut self, state: &mut S, input: &mut S::Input) -> Result<MutationResult, Error> {
+    #[expect(clippy::cast_sign_loss)]
+    fn mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error> {
         let id = random_corpus_id_with_disabled!(state.corpus(), state.rand_mut());
         // We don't want to use the testcase we're already using for splicing
         if let Some(cur) = state.corpus().current() {
@@ -1463,7 +1732,7 @@ mod tests {
             }
             let mut gaps = 0;
             let mut range = 0..10;
-            let mut iter = mutated.bytes.iter().copied();
+            let mut iter = mutated.as_ref().iter().copied();
             while let Some(expected) = range.next() {
                 if let Some(last) = iter.next() {
                     if expected != last {
@@ -1482,9 +1751,11 @@ mod tests {
                 }
             }
             assert_eq!(
-                gaps, 1,
+                gaps,
+                1,
                 "{:?} should have exactly one gap, found {}",
-                mutated.bytes, gaps
+                mutated.as_ref(),
+                gaps
             );
         }
 
@@ -1516,20 +1787,20 @@ mod tests {
                 continue;
             }
             let mut expansion = 0;
-            let mut expansion_len = base.bytes.len();
-            for (i, value) in mutated.bytes.iter().copied().enumerate() {
+            let mut expansion_len = base.as_ref().len();
+            for (i, value) in mutated.as_ref().iter().copied().enumerate() {
                 if i as u8 != value {
                     expansion = value as usize;
                     expansion_len = i - expansion;
                     break;
                 }
             }
-            assert_eq!(mutated.bytes.len(), base.bytes.len() + expansion_len);
+            assert_eq!(mutated.as_ref().len(), base.as_ref().len() + expansion_len);
             for (expected, value) in (0..(expansion + expansion_len))
-                .chain(expansion..base.bytes.len())
-                .zip(mutated.bytes)
+                .chain(expansion..base.as_ref().len())
+                .zip(mutated.as_ref())
             {
-                assert_eq!(expected as u8, value);
+                assert_eq!(expected as u8, *value);
             }
             for i in (expansion..).take(expansion_len) {
                 counts[i] += 1;
@@ -1565,19 +1836,19 @@ mod tests {
                 continue;
             }
             let mut inserted = 0;
-            for (i, value) in mutated.bytes.iter().copied().enumerate() {
+            for (i, value) in mutated.as_ref().iter().copied().enumerate() {
                 if i as u8 != value {
                     inserted = value;
                     break;
                 }
             }
-            assert!(mutated.bytes.len() <= base.bytes.len() + 16);
+            assert!(mutated.as_ref().len() <= base.as_ref().len() + 16);
             assert_eq!(
-                bytecount::count(&mutated.bytes, inserted),
-                mutated.bytes.len() - base.bytes.len() + 1
+                bytecount::count(mutated.as_ref(), inserted),
+                mutated.as_ref().len() - base.as_ref().len() + 1
             );
             counts[inserted as usize] += 1;
-            insertions[mutated.bytes.len() - base.bytes.len() - 1] += 1;
+            insertions[mutated.as_ref().len() - base.as_ref().len() - 1] += 1;
         }
 
         let average = counts.iter().copied().sum::<usize>() / counts.len();
@@ -1615,22 +1886,22 @@ mod tests {
                 continue;
             }
             let mut inserted = 10;
-            for (i, value) in mutated.bytes.iter().copied().enumerate() {
+            for (i, value) in mutated.as_ref().iter().copied().enumerate() {
                 if i as u8 != value {
                     inserted = value;
                     break;
                 }
             }
-            assert!(mutated.bytes.len() <= base.bytes.len() + 16);
-            let offset = usize::from((inserted as usize) < base.bytes.len());
+            assert!(mutated.as_ref().len() <= base.as_ref().len() + 16);
+            let offset = usize::from((inserted as usize) < base.as_ref().len());
             assert_eq!(
-                bytecount::count(&mutated.bytes, inserted),
-                mutated.bytes.len() - base.bytes.len() + offset,
+                bytecount::count(mutated.as_ref(), inserted),
+                mutated.as_ref().len() - base.as_ref().len() + offset,
                 "{:?}",
-                mutated.bytes
+                mutated.as_ref()
             );
             counts[inserted as usize] += 1;
-            insertions[mutated.bytes.len() - base.bytes.len() - 1] += 1;
+            insertions[mutated.as_ref().len() - base.as_ref().len() - 1] += 1;
         }
 
         let average = counts.iter().copied().sum::<usize>() / counts.len();

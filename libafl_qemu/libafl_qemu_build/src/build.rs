@@ -11,9 +11,8 @@ use crate::cargo_add_rpath;
 
 pub const QEMU_URL: &str = "https://github.com/AFLplusplus/qemu-libafl-bridge";
 pub const QEMU_DIRNAME: &str = "qemu-libafl-bridge";
-pub const QEMU_REVISION: &str = "ee43af7f80d1117857e58b0b7ef556652d5893d5";
+pub const QEMU_REVISION: &str = "ace364678aef879514e150e626695c4793db41e9";
 
-#[allow(clippy::module_name_repetitions)]
 pub struct BuildResult {
     pub qemu_path: PathBuf,
     pub build_dir: PathBuf,
@@ -59,7 +58,7 @@ fn get_config_signature(config_cmd: &Command) -> String {
     signature_string
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn configure_qemu(
     cc_compiler: &cc::Tool,
     cpp_compiler: &cc::Tool,
@@ -90,13 +89,18 @@ fn configure_qemu(
         .arg(format!("--cxx={}", linker_interceptor_plus_plus.display()))
         .arg("--as-shared-lib")
         .arg(format!("--target-list={cpu_target}-{target_suffix}"))
+        .arg("--disable-bsd-user")
         // .arg("--disable-capstone")
-        .arg("--disable-bsd-user");
+        .arg("--disable-docs")
+        .arg("--disable-tests")
+        .arg("--disable-tools");
 
     if cfg!(feature = "paranoid_debug") {
-        cmd.arg("--enable-debug")
-            .arg("--enable-debug-tcg")
-            .arg("--enable-sanitizers");
+        cmd.arg("--enable-debug").arg("--enable-debug-tcg");
+    }
+
+    if cfg!(feature = "qemu_sanitizers") {
+        cmd.arg("--enable-sanitizers");
     }
 
     if is_usermode {
@@ -137,13 +141,14 @@ fn configure_qemu(
         .arg("--disable-gio")
         .arg("--disable-glusterfs")
         .arg("--disable-gnutls")
-        .arg("--disable-gtk")
-        .arg("--disable-guest-agent")
-        .arg("--disable-guest-agent-msi")
+        // .arg("--disable-gtk")
+        // .arg("--disable-guest-agent")
+        // .arg("--disable-guest-agent-msi")
         .arg("--disable-hvf")
         .arg("--disable-iconv")
         .arg("--disable-jack")
         .arg("--disable-keyring")
+        // .arg("--disable-kvm")
         .arg("--disable-libdaxctl")
         .arg("--disable-libiscsi")
         .arg("--disable-libnfs")
@@ -154,7 +159,7 @@ fn configure_qemu(
         .arg("--disable-linux-aio")
         .arg("--disable-linux-io-uring")
         .arg("--disable-linux-user")
-        .arg("--disable-live-block-migration")
+        // .arg("--disable-live-block-migration")
         .arg("--disable-lzfse")
         .arg("--disable-lzo")
         .arg("--disable-l2tpv3")
@@ -170,7 +175,7 @@ fn configure_qemu(
         .arg("--disable-pa")
         .arg("--disable-parallels")
         .arg("--disable-png")
-        .arg("--disable-pvrdma")
+        // .arg("--disable-pvrdma")
         .arg("--disable-qcow1")
         .arg("--disable-qed")
         .arg("--disable-qga-vss")
@@ -213,8 +218,7 @@ fn configure_qemu(
         .arg("--disable-xen")
         .arg("--disable-xen-pci-passthrough")
         .arg("--disable-xkbcommon")
-        .arg("--disable-zstd")
-        .arg("--disable-tests");
+        .arg("--disable-zstd");
     }
 
     cmd
@@ -242,7 +246,7 @@ fn build_qemu(
     cmd
 }
 
-#[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
+#[expect(clippy::too_many_lines, clippy::missing_panics_doc)]
 #[must_use]
 pub fn build(
     cpu_target: &str,
@@ -431,29 +435,6 @@ pub fn build(
 
     assert!(output_lib.is_file()); // Make sure this isn't very very wrong
 
-    /*
-    let mut objects = vec![];
-    for dir in [
-        build_dir.join("libcommon.fa.p"),
-        build_dir.join(format!("libqemu-{cpu_target}-{target_suffix}.fa.p")),
-    ] {
-        for path in fs::read_dir(dir).unwrap() {
-            let path = path.unwrap().path();
-            if path.is_file() {
-                if let Some(name) = path.file_name() {
-                    if name.to_string_lossy().starts_with("stubs") {
-                        continue;
-                    } else if let Some(ext) = path.extension() {
-                        if ext == "o" {
-                            objects.push(path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    */
-
     let compile_commands_string = &fs::read_to_string(libafl_qemu_build_dir.join("linkinfo.json"))
         .expect("Failed to read linkinfo.json");
 
@@ -513,90 +494,6 @@ pub fn build(
             panic!("Linking failed.");
         }
 
-        /* // Old manual linking, kept here for reference and debugging
-        if is_usermode {
-            Command::new("ld")
-                .current_dir(out_dir_path)
-                .arg("-o")
-                .arg("libqemu-partially-linked.o")
-                .arg("-r")
-                .args(objects)
-                .arg("--start-group")
-                .arg("--whole-archive")
-                .arg(format!("{}/libhwcore.fa", build_dir.display()))
-                .arg(format!("{}/libqom.fa", build_dir.display()))
-                .arg(format!("{}/libevent-loop-base.a", build_dir.display()))
-                .arg(format!("{}/gdbstub/libgdb_user.fa", build_dir.display()))
-                .arg("--no-whole-archive")
-                .arg(format!("{}/libqemuutil.a", build_dir.display()))
-                .arg(format!("{}/libhwcore.fa", build_dir.display()))
-                .arg(format!("{}/libqom.fa", build_dir.display()))
-                .arg(format!("{}/gdbstub/libgdb_user.fa", build_dir.display()))
-                .arg(format!(
-                    "--dynamic-list={}/plugins/qemu-plugins.symbols",
-                    qemu_path.display()
-                ))
-                .arg("--end-group")
-                .status()
-                .expect("Partial linked failure");
-        } else {
-            Command::new("ld")
-                .current_dir(out_dir_path)
-                .arg("-o")
-                .arg("libqemu-partially-linked.o")
-                .arg("-r")
-                .args(objects)
-                .arg("--start-group")
-                .arg("--whole-archive")
-                .arg(format!("{}/libhwcore.fa", build_dir.display()))
-                .arg(format!("{}/libqom.fa", build_dir.display()))
-                .arg(format!("{}/libevent-loop-base.a", build_dir.display()))
-                .arg(format!("{}/gdbstub/libgdb_softmmu.fa", build_dir.display()))
-                .arg(format!("{}/libio.fa", build_dir.display()))
-                .arg(format!("{}/libcrypto.fa", build_dir.display()))
-                .arg(format!("{}/libauthz.fa", build_dir.display()))
-                .arg(format!("{}/libblockdev.fa", build_dir.display()))
-                .arg(format!("{}/libblock.fa", build_dir.display()))
-                .arg(format!("{}/libchardev.fa", build_dir.display()))
-                .arg(format!("{}/libqmp.fa", build_dir.display()))
-                .arg("--no-whole-archive")
-                .arg(format!("{}/libqemuutil.a", build_dir.display()))
-                .arg(format!(
-                    "{}/subprojects/dtc/libfdt/libfdt.a",
-                    build_dir.display()
-                ))
-                .arg(format!(
-                    "{}/subprojects/libvhost-user/libvhost-user-glib.a",
-                    build_dir.display()
-                ))
-                .arg(format!(
-                    "{}/subprojects/libvhost-user/libvhost-user.a",
-                    build_dir.display()
-                ))
-                .arg(format!(
-                    "{}/subprojects/libvduse/libvduse.a",
-                    build_dir.display()
-                ))
-                .arg(format!("{}/libmigration.fa", build_dir.display()))
-                .arg(format!("{}/libhwcore.fa", build_dir.display()))
-                .arg(format!("{}/libqom.fa", build_dir.display()))
-                .arg(format!("{}/gdbstub/libgdb_softmmu.fa", build_dir.display()))
-                .arg(format!("{}/libio.fa", build_dir.display()))
-                .arg(format!("{}/libcrypto.fa", build_dir.display()))
-                .arg(format!("{}/libauthz.fa", build_dir.display()))
-                .arg(format!("{}/libblockdev.fa", build_dir.display()))
-                .arg(format!("{}/libblock.fa", build_dir.display()))
-                .arg(format!("{}/libchardev.fa", build_dir.display()))
-                .arg(format!("{}/libqmp.fa", build_dir.display()))
-                .arg(format!(
-                    "--dynamic-list={}/plugins/qemu-plugins.symbols",
-                    qemu_path.display()
-                ))
-                .arg("--end-group")
-                .status()
-                .expect("Partial linked failure");
-        }*/
-
         Command::new("ar")
             .current_dir(out_dir_path)
             .arg("crs")
@@ -638,29 +535,12 @@ pub fn build(
         }
     }
 
-    if cfg!(feature = "paranoid_debug") {
+    if cfg!(feature = "qemu_sanitizers") {
         println!("cargo:rustc-link-lib=ubsan");
         println!("cargo:rustc-link-lib=asan");
     }
 
-    /*
-    println!("cargo:rustc-link-lib=rt");
-    println!("cargo:rustc-link-lib=gmodule-2.0");
-    println!("cargo:rustc-link-lib=glib-2.0");
-    println!("cargo:rustc-link-lib=stdc++");
-    println!("cargo:rustc-link-lib=z");
-    // if keyutils is available, qemu meson script will compile code with keyutils.
-    // therefore, we need to link with keyutils if our system have libkeyutils.
-    let _: Result<pkg_config::Library, pkg_config::Error> =
-        pkg_config::Config::new().probe("libkeyutils");
-    */
-
     if !is_usermode {
-        //println!("cargo:rustc-link-lib=pixman-1");
-        //if env::var("LINK_SLIRP").is_ok() || cfg!(feature = "slirp") {
-        //    println!("cargo:rustc-link-lib=slirp");
-        //}
-
         fs::create_dir_all(target_dir.join("pc-bios")).unwrap();
         for path in fs::read_dir(libafl_qemu_build_dir.join("pc-bios")).unwrap() {
             let path = path.unwrap().path();

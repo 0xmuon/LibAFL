@@ -7,6 +7,8 @@ use libafl_bolts::prelude::*;
 
 /// Coverage map with explicit assignments due to the lack of instrumentation
 static mut SIGNALS: [u8; 16] = [0; 16];
+// TODO: This will break soon, fix me! See https://github.com/AFLplusplus/LibAFL/issues/2786
+#[allow(static_mut_refs)] // only a problem in nightly
 static mut SIGNALS_PTR: *mut u8 = unsafe { SIGNALS.as_mut_ptr() };
 
 /// Assign a signal to the signals map
@@ -14,7 +16,6 @@ fn signals_set(idx: usize) {
     unsafe { write(SIGNALS_PTR.add(idx), 1) };
 }
 
-#[allow(clippy::similar_names)]
 pub fn main() -> Result<(), Error> {
     // The closure that we want to fuzz
     let mut harness = |input: &BytesInput| {
@@ -34,6 +35,8 @@ pub fn main() -> Result<(), Error> {
     };
 
     // Create an observation channel using the signals map
+    // TODO: This will break soon, fix me! See https://github.com/AFLplusplus/LibAFL/issues/2786
+    #[allow(static_mut_refs)] // only a problem in nightly
     let observer = unsafe { StdMapObserver::from_mut_ptr("signals", SIGNALS_PTR, SIGNALS.len()) };
 
     let factory = MapEqualityFactory::new(&observer);
@@ -86,7 +89,7 @@ pub fn main() -> Result<(), Error> {
     .expect("Failed to create the Executor");
 
     // Generator of printable bytearrays of max size 32
-    let mut generator = RandPrintablesGenerator::new(32);
+    let mut generator = RandPrintablesGenerator::new(nonzero!(32));
 
     // Generate 8 initial inputs
     state
@@ -94,8 +97,8 @@ pub fn main() -> Result<(), Error> {
         .expect("Failed to generate the initial corpus");
 
     // Setup a mutational stage with a basic bytes mutator
-    let mutator = StdScheduledMutator::new(havoc_mutations::<BytesInput>());
-    let minimizer = StdScheduledMutator::new(havoc_mutations::<BytesInput>());
+    let mutator = StdScheduledMutator::new(havoc_mutations());
+    let minimizer = StdScheduledMutator::new(havoc_mutations());
     let mut stages = tuple_list!(
         StdMutationalStage::new(mutator),
         StdTMinMutationalStage::new(minimizer, factory, 128)
@@ -121,7 +124,7 @@ pub fn main() -> Result<(), Error> {
 
     let mut mgr = SimpleEventManager::new(mon);
 
-    let minimizer = StdScheduledMutator::new(havoc_mutations::<BytesInput>());
+    let minimizer = StdScheduledMutator::new(havoc_mutations());
     let mut stages = tuple_list!(StdTMinMutationalStage::new(
         minimizer,
         CrashFeedback::new(),

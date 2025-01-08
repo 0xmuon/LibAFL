@@ -96,14 +96,14 @@ impl<'a, T> From<&'a [T]> for SliceReader<'a, T> {
     }
 }
 
-impl<'a, T> HasLen for SubRangeSlice<'a, T> {
+impl<T> HasLen for SubRangeSlice<'_, T> {
     #[inline]
     fn len(&self) -> usize {
         self.range.len()
     }
 }
 
-impl<'a, T> HasLen for SubRangeMutSlice<'a, T> {
+impl<T> HasLen for SubRangeMutSlice<'_, T> {
     #[inline]
     fn len(&self) -> usize {
         self.range.len()
@@ -198,7 +198,7 @@ impl<'a, T> PartialSubRangeSlice<'a, T> {
     /// Consumes `PartialBytesSubInput` and returns the partial slice if it was a partial slice, None otherwise.
     #[must_use]
     pub fn partial(self) -> Option<SubRangeSlice<'a, T>> {
-        #[allow(clippy::match_wildcard_for_single_variants)]
+        #[expect(clippy::match_wildcard_for_single_variants)]
         match self {
             PartialSubRangeSlice::Partial(partial_slice) => Some(partial_slice),
             _ => None,
@@ -349,7 +349,7 @@ mod tests {
 
         let bytes_read = bytes_reader.next_sub_slice_truncated(8);
         let bytes_read_ref: &[u8] = &[];
-        assert_eq!(&*bytes_read.as_slice(), bytes_read_ref);
+        assert_eq!(bytes_read.as_slice(), bytes_read_ref);
     }
 
     #[test]

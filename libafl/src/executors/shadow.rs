@@ -1,12 +1,17 @@
 //! A `ShadowExecutor` wraps an executor to have shadow observer that will not be considered by the feedbacks and the manager
 
-use core::fmt::{self, Debug, Formatter};
+use core::{
+    fmt::{self, Debug, Formatter},
+    time::Duration,
+};
 
 use libafl_bolts::tuples::RefIndexable;
 
+use super::HasTimeout;
 use crate::{
     executors::{Executor, ExitKind, HasObservers},
-    observers::{ObserversTuple, UsesObservers},
+    inputs::UsesInput,
+    observers::ObserversTuple,
     state::UsesState,
     Error,
 };
@@ -34,8 +39,8 @@ where
 
 impl<E, SOT> ShadowExecutor<E, SOT>
 where
-    E: HasObservers,
-    SOT: ObserversTuple<<Self as UsesState>::State>,
+    E: HasObservers + UsesState,
+    SOT: ObserversTuple<<Self as UsesInput>::Input, <Self as UsesState>::State>,
 {
     /// Create a new `ShadowExecutor`, wrapping the given `executor`.
     pub fn new(executor: E, shadow_observers: SOT) -> Self {
@@ -61,9 +66,8 @@ where
 impl<E, EM, SOT, Z> Executor<EM, Z> for ShadowExecutor<E, SOT>
 where
     E: Executor<EM, Z> + HasObservers,
-    SOT: ObserversTuple<Self::State>,
+    SOT: ObserversTuple<Self::Input, Self::State>,
     EM: UsesState<State = Self::State>,
-    Z: UsesState<State = Self::State>,
 {
     fn run_target(
         &mut self,
@@ -76,6 +80,20 @@ where
     }
 }
 
+impl<E, SOT> HasTimeout for ShadowExecutor<E, SOT>
+where
+    E: HasTimeout,
+{
+    #[inline]
+    fn set_timeout(&mut self, timeout: Duration) {
+        self.executor.set_timeout(timeout);
+    }
+    #[inline]
+    fn timeout(&self) -> Duration {
+        self.executor.timeout()
+    }
+}
+
 impl<E, SOT> UsesState for ShadowExecutor<E, SOT>
 where
     E: UsesState,
@@ -83,18 +101,12 @@ where
     type State = E::State;
 }
 
-impl<E, SOT> UsesObservers for ShadowExecutor<E, SOT>
-where
-    E: UsesObservers,
-{
-    type Observers = E::Observers;
-}
-
 impl<E, SOT> HasObservers for ShadowExecutor<E, SOT>
 where
-    E: HasObservers,
-    SOT: ObserversTuple<Self::State>,
+    E: HasObservers + UsesState,
+    SOT: ObserversTuple<<Self as UsesInput>::Input, <Self as UsesState>::State>,
 {
+    type Observers = E::Observers;
     #[inline]
     fn observers(&self) -> RefIndexable<&Self::Observers, Self::Observers> {
         self.executor.observers()

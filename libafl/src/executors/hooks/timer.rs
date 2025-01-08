@@ -1,12 +1,7 @@
 //! The struct `TimerStruct` will absorb all the difference in timeout implementation in various system.
-#[cfg(any(windows, target_os = "linux"))]
-use core::ptr::addr_of_mut;
 use core::time::Duration;
 #[cfg(target_os = "linux")]
-use core::{
-    mem::zeroed,
-    ptr::{addr_of, null_mut},
-};
+use core::{mem::zeroed, ptr::null_mut};
 
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) const ITIMER_REAL: core::ffi::c_int = 0;
@@ -43,7 +38,7 @@ pub(crate) struct Timeval {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 impl core::fmt::Debug for Timeval {
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
@@ -63,7 +58,7 @@ pub(crate) struct Itimerval {
     pub it_value: Timeval,
 }
 
-#[cfg(all(feature = "std", unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(target_os = "linux")))]
 extern "C" {
     pub(crate) fn setitimer(
         which: libc::c_int,
@@ -74,7 +69,7 @@ extern "C" {
 
 /// The strcut about all the internals of the timer.
 /// This struct absorb all platform specific differences about timer.
-#[allow(missing_debug_implementations)]
+#[expect(missing_debug_implementations)]
 pub struct TimerStruct {
     // timeout time (windows)
     #[cfg(windows)]
@@ -107,8 +102,8 @@ pub struct TimerStruct {
     pub(crate) tmout_start_time: Duration,
 }
 
-#[cfg(all(feature = "std", windows))]
-#[allow(non_camel_case_types)]
+#[cfg(windows)]
+#[expect(non_camel_case_types)]
 type PTP_TIMER_CALLBACK = unsafe extern "system" fn(
     param0: PTP_CALLBACK_INSTANCE,
     param1: *mut c_void,
@@ -187,7 +182,7 @@ impl TimerStruct {
         let ptp_timer = unsafe {
             CreateThreadpoolTimer(
                 Some(timeout_handler),
-                Some(addr_of_mut!(GLOBAL_STATE) as *mut c_void),
+                Some(&raw mut GLOBAL_STATE as *mut c_void),
                 Some(&TP_CALLBACK_ENVIRON_V3::default()),
             )
         }
@@ -206,8 +201,6 @@ impl TimerStruct {
 
     #[cfg(target_os = "linux")]
     #[must_use]
-    #[allow(unused_unsafe)]
-    #[allow(unused_mut)]
     /// Create a `TimerStruct` with the specified timeout
     pub fn new(exec_tmout: Duration) -> Self {
         let milli_sec = exec_tmout.as_millis();
@@ -223,11 +216,12 @@ impl TimerStruct {
             it_interval,
             it_value,
         };
+        #[allow(unused_mut)] // miri doesn't mutate this
         let mut timerid: libc::timer_t = null_mut();
+        #[cfg(not(miri))]
         unsafe {
-            #[cfg(not(miri))]
             // creates a new per-process interval timer
-            libc::timer_create(libc::CLOCK_MONOTONIC, null_mut(), addr_of_mut!(timerid));
+            libc::timer_create(libc::CLOCK_MONOTONIC, null_mut(), &raw mut timerid);
         }
 
         Self {
@@ -247,6 +241,11 @@ impl TimerStruct {
     #[cfg(target_os = "linux")]
     #[must_use]
     /// Constructor but use batch mode
+    /// More efficient timeout mechanism with imprecise timing.
+    ///
+    /// The timeout will trigger after t seconds and at most within 2*t seconds.
+    /// This means the actual timeout may occur anywhere in the range [t, 2*t],
+    /// providing a flexible but bounded execution time limit.
     pub fn batch_mode(exec_tmout: Duration) -> Self {
         let mut me = Self::new(exec_tmout);
         me.batch_mode = true;
@@ -256,22 +255,24 @@ impl TimerStruct {
     #[cfg(all(unix, not(target_os = "linux")))]
     /// Set up timer
     pub fn set_timer(&mut self) {
+        // # Safety
+        // Safe because the variables are all alive at this time and don't contain pointers.
         unsafe {
             setitimer(ITIMER_REAL, &mut self.itimerval, core::ptr::null_mut());
         }
     }
 
     #[cfg(windows)]
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     /// Set timer
     pub fn set_timer(&mut self) {
         unsafe {
-            let data = addr_of_mut!(GLOBAL_STATE);
+            let data = &raw mut GLOBAL_STATE;
 
-            write_volatile(addr_of_mut!((*data).ptp_timer), Some(*self.ptp_timer()));
+            write_volatile(&raw mut (*data).ptp_timer, Some(*self.ptp_timer()));
             write_volatile(
-                addr_of_mut!((*data).critical),
-                addr_of_mut!(*self.critical_mut()) as *mut c_void,
+                &raw mut (*data).critical,
+                &raw mut (*self.critical_mut()) as *mut c_void,
             );
             let tm: i64 = -self.milli_sec() * 10 * 1000;
             let ft = FILETIME {
@@ -298,48 +299,49 @@ impl TimerStruct {
         unsafe {
             if self.batch_mode {
                 if self.executions == 0 {
-                    libc::timer_settime(self.timerid, 0, addr_of_mut!(self.itimerspec), null_mut());
+                    libc::timer_settime(self.timerid, 0, &raw mut self.itimerspec, null_mut());
                     self.tmout_start_time = current_time();
                 }
                 self.start_time = current_time();
             } else {
                 #[cfg(not(miri))]
-                libc::timer_settime(self.timerid, 0, addr_of_mut!(self.itimerspec), null_mut());
+                libc::timer_settime(self.timerid, 0, &raw mut self.itimerspec, null_mut());
             }
         }
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
-    /// Disalarm timer
+    /// Disable the timer
     pub fn unset_timer(&mut self) {
+        // # Safety
+        // No user-provided values.
         unsafe {
             let mut itimerval_zero: Itimerval = core::mem::zeroed();
             setitimer(ITIMER_REAL, &mut itimerval_zero, core::ptr::null_mut());
         }
     }
 
-    /// Disalarm timer
+    /// Disable the timer
     #[cfg(target_os = "linux")]
-    #[allow(unused_variables)]
     pub fn unset_timer(&mut self) {
+        // # Safety
+        // Just API calls, no user-provided inputs
         if self.batch_mode {
             unsafe {
                 let elapsed = current_time().saturating_sub(self.tmout_start_time);
-                let elapsed_since_signal = current_time().saturating_sub(self.tmout_start_time);
                 // elapsed may be > than tmout in case of received but ingored signal
                 if elapsed > self.exec_tmout
                     || self.exec_tmout.saturating_sub(elapsed) < self.avg_exec_time * self.avg_mul_k
                 {
                     let disarmed: libc::itimerspec = zeroed();
-                    libc::timer_settime(self.timerid, 0, addr_of!(disarmed), null_mut());
+                    libc::timer_settime(self.timerid, 0, &raw const disarmed, null_mut());
                     // set timer the next exec
                     if self.executions > 0 {
                         self.avg_exec_time = elapsed / self.executions;
                         self.executions = 0;
                     }
                     // readjust K
-                    if elapsed_since_signal > self.exec_tmout * self.avg_mul_k && self.avg_mul_k > 1
-                    {
+                    if elapsed > self.exec_tmout * self.avg_mul_k && self.avg_mul_k > 1 {
                         self.avg_mul_k -= 1;
                     }
                 } else {
@@ -347,19 +349,21 @@ impl TimerStruct {
                 }
             }
         } else {
+            #[cfg(not(miri))]
             unsafe {
                 let disarmed: libc::itimerspec = zeroed();
-                #[cfg(not(miri))]
-                libc::timer_settime(self.timerid, 0, addr_of!(disarmed), null_mut());
+                libc::timer_settime(self.timerid, 0, &raw const disarmed, null_mut());
             }
         }
     }
 
     #[cfg(windows)]
-    /// Disalarm
+    /// Disable the timer
     pub fn unset_timer(&mut self) {
+        // # Safety
+        // The value accesses are guarded by a critical section.
         unsafe {
-            let data = addr_of_mut!(GLOBAL_STATE);
+            let data = &raw mut GLOBAL_STATE;
 
             compiler_fence(Ordering::SeqCst);
             EnterCriticalSection(self.critical_mut());

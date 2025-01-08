@@ -1,17 +1,17 @@
 use std::{
-    intrinsics::copy_nonoverlapping, mem::MaybeUninit, slice::from_raw_parts,
-    str::from_utf8_unchecked,
+    intrinsics::copy_nonoverlapping, mem::MaybeUninit, slice::from_raw_parts_mut,
+    str::from_utf8_unchecked_mut,
 };
 
 use libafl_qemu_sys::{
-    exec_path, free_self_maps, guest_base, libafl_force_dfl, libafl_get_brk, libafl_load_addr,
-    libafl_maps_first, libafl_maps_next, libafl_qemu_run, libafl_set_brk, mmap_next_start,
-    pageflags_get_root, read_self_maps, GuestAddr, GuestUsize, IntervalTreeNode, IntervalTreeRoot,
-    MapInfo, MmapPerms, VerifyAccess,
+    exec_path, free_self_maps, guest_base, libafl_force_dfl, libafl_get_brk,
+    libafl_get_initial_brk, libafl_load_addr, libafl_maps_first, libafl_maps_next, libafl_qemu_run,
+    libafl_set_brk, mmap_next_start, pageflags_get_root, read_self_maps, GuestAddr, GuestUsize,
+    IntervalTreeNode, IntervalTreeRoot, MapInfo, MmapPerms, VerifyAccess,
 };
-use libc::{c_char, c_int, strlen};
+use libc::{c_int, c_uchar, strlen};
 #[cfg(feature = "python")]
-use pyo3::{pyclass, pymethods, IntoPy, PyObject, PyRef, PyRefMut, Python};
+use pyo3::{pyclass, pymethods, IntoPyObject, Py, PyRef, PyRefMut, Python};
 
 use crate::{Qemu, CPU};
 
@@ -40,7 +40,6 @@ impl GuestMaps {
 impl Iterator for GuestMaps {
     type Item = MapInfo;
 
-    #[allow(clippy::uninit_assumed_init)]
     fn next(&mut self) -> Option<Self::Item> {
         unsafe {
             let mut ret = MaybeUninit::uninit();
@@ -65,8 +64,9 @@ impl GuestMaps {
     fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
         slf
     }
-    fn __next__(mut slf: PyRefMut<Self>) -> Option<PyObject> {
-        Python::with_gil(|py| slf.next().map(|x| x.into_py(py)))
+
+    fn __next__(mut slf: PyRefMut<Self>) -> Option<Py<MapInfo>> {
+        Python::with_gil(|py| slf.next().map(|x| x.into_pyobject(py).unwrap().into()))
     }
 }
 
@@ -79,30 +79,50 @@ impl Drop for GuestMaps {
 }
 
 impl CPU {
-    /// Write a value to a guest address.
-    ///
-    /// # Safety
-    /// This will write to a translated guest address (using `g2h`).
-    /// It just adds `guest_base` and writes to that location, without checking the bounds.
-    /// This may only be safely used for valid guest addresses!
-    pub unsafe fn write_mem(&self, addr: GuestAddr, buf: &[u8]) {
-        let host_addr = Qemu::get().unwrap().g2h(addr);
-        copy_nonoverlapping(buf.as_ptr(), host_addr, buf.len());
-    }
-
     /// Read a value from a guest address.
+    /// The input address is not checked for validity.
     ///
     /// # Safety
     /// This will read from a translated guest address (using `g2h`).
     /// It just adds `guest_base` and writes to that location, without checking the bounds.
     /// This may only be safely used for valid guest addresses!
-    pub unsafe fn read_mem(&self, addr: GuestAddr, buf: &mut [u8]) {
+    pub unsafe fn read_mem_unchecked(&self, addr: GuestAddr, buf: &mut [u8]) {
         let host_addr = Qemu::get().unwrap().g2h(addr);
         copy_nonoverlapping(host_addr, buf.as_mut_ptr(), buf.len());
     }
+
+    /// Write a value to a guest address.
+    /// The input address in not checked for validity.
+    ///
+    /// # Safety
+    /// This will write to a translated guest address (using `g2h`).
+    /// It just adds `guest_base` and writes to that location, without checking the bounds.
+    /// This may only be safely used for valid guest addresses!
+    pub unsafe fn write_mem_unchecked(&self, addr: GuestAddr, buf: &[u8]) {
+        let host_addr = Qemu::get().unwrap().g2h(addr);
+        copy_nonoverlapping(buf.as_ptr(), host_addr, buf.len());
+    }
+
+    #[must_use]
+    pub fn g2h<T>(&self, addr: GuestAddr) -> *mut T {
+        unsafe { (addr as usize + guest_base) as *mut T }
+    }
+
+    #[must_use]
+    pub fn h2g<T>(&self, addr: *const T) -> GuestAddr {
+        unsafe { (addr as usize - guest_base) as GuestAddr }
+    }
+
+    #[must_use]
+    pub fn access_ok(&self, kind: VerifyAccess, addr: GuestAddr, size: usize) -> bool {
+        unsafe {
+            // TODO add support for tagged GuestAddr
+            libafl_qemu_sys::page_check_range(addr, size as GuestAddr, kind.into())
+        }
+    }
 }
 
-#[allow(clippy::unused_self)]
+#[expect(clippy::unused_self)]
 impl Qemu {
     #[must_use]
     pub fn mappings(&self) -> GuestMaps {
@@ -139,9 +159,9 @@ impl Qemu {
     #[must_use]
     pub fn binary_path<'a>(&self) -> &'a str {
         unsafe {
-            from_utf8_unchecked(from_raw_parts(
-                exec_path,
-                strlen(exec_path as *const c_char),
+            from_utf8_unchecked_mut(from_raw_parts_mut(
+                exec_path as *mut c_uchar,
+                strlen(exec_path.cast_const()),
             ))
         }
     }
@@ -154,6 +174,11 @@ impl Qemu {
     #[must_use]
     pub fn get_brk(&self) -> GuestAddr {
         unsafe { libafl_get_brk() as GuestAddr }
+    }
+
+    #[must_use]
+    pub fn get_initial_brk(&self) -> GuestAddr {
+        unsafe { libafl_get_initial_brk() as GuestAddr }
     }
 
     pub fn set_brk(&self, brk: GuestAddr) {
@@ -169,7 +194,7 @@ impl Qemu {
         unsafe { mmap_next_start = start };
     }
 
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn mmap(
         self,
         addr: GuestAddr,
@@ -261,7 +286,7 @@ pub mod pybind {
         a6: u64,
         a7: u64,
     ) -> SyscallHookResult {
-        unsafe { PY_SYSCALL_HOOK.as_ref() }.map_or_else(
+        unsafe { (&raw const PY_SYSCALL_HOOK).read() }.map_or_else(
             || SyscallHookResult::new(None),
             |obj| {
                 let args = (sys_num, a0, a1, a2, a3, a4, a5, a6, a7);
@@ -338,7 +363,9 @@ pub mod pybind {
             self.qemu.unmap(addr, size).map_err(PyValueError::new_err)
         }
 
-        fn set_syscall_hook(&self, hook: PyObject) {
+        /// # Safety
+        /// Accesses the global `PY_SYSCALL_HOOK` and may not be called concurrently.
+        unsafe fn set_syscall_hook(&self, hook: PyObject) {
             unsafe {
                 PY_SYSCALL_HOOK = Some(hook);
             }

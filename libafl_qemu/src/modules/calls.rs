@@ -10,11 +10,13 @@ use libafl_bolts::tuples::{Handle, Handled, MatchFirstType, MatchNameRef};
 use libafl_qemu_sys::GuestAddr;
 use thread_local::ThreadLocal;
 
+#[cfg(feature = "systemmode")]
+use crate::modules::utils::filters::{NopPageFilter, NOP_PAGE_FILTER};
 use crate::{
     capstone,
     modules::{
-        EmulatorModule, EmulatorModuleTuple, EmulatorModules, HasInstrumentationFilter, IsFilter,
-        QemuInstrumentationAddressRangeFilter,
+        utils::filters::StdAddressFilter, AddressFilter, EmulatorModule, EmulatorModuleTuple,
+        EmulatorModules,
     },
     qemu::{ArchExtras, Hook},
     Qemu,
@@ -55,7 +57,7 @@ pub trait CallTraceCollector: 'static {
         _observers: &mut OT,
         _exit_kind: &mut ExitKind,
     ) where
-        OT: ObserversTuple<S>,
+        OT: ObserversTuple<S::Input, S>,
         S: Unpin + UsesInput,
     {
     }
@@ -93,7 +95,7 @@ pub trait CallTraceCollectorTuple: 'static + MatchFirstType {
         _observers: &mut OT,
         _exit_kind: &mut ExitKind,
     ) where
-        OT: ObserversTuple<S>,
+        OT: ObserversTuple<S::Input, S>,
         S: Unpin + UsesInput;
 }
 
@@ -135,7 +137,7 @@ impl CallTraceCollectorTuple for () {
         _observers: &mut OT,
         _exit_kind: &mut ExitKind,
     ) where
-        OT: ObserversTuple<S>,
+        OT: ObserversTuple<S::Input, S>,
         S: Unpin + UsesInput,
     {
     }
@@ -205,7 +207,7 @@ where
         observers: &mut OT,
         exit_kind: &mut ExitKind,
     ) where
-        OT: ObserversTuple<S>,
+        OT: ObserversTuple<S::Input, S>,
         S: Unpin + UsesInput,
     {
         self.0.post_exec(qemu, input, observers, exit_kind);
@@ -218,7 +220,7 @@ pub struct CallTracerModule<T>
 where
     T: CallTraceCollectorTuple,
 {
-    filter: QemuInstrumentationAddressRangeFilter,
+    filter: StdAddressFilter,
     cs: Capstone,
     collectors: Option<T>,
 }
@@ -228,7 +230,7 @@ where
     T: CallTraceCollectorTuple + Debug,
 {
     #[must_use]
-    pub fn new(filter: QemuInstrumentationAddressRangeFilter, collectors: T) -> Self {
+    pub fn new(filter: StdAddressFilter, collectors: T) -> Self {
         Self {
             filter,
             cs: capstone().detail(true).build().unwrap(),
@@ -238,10 +240,11 @@ where
 
     #[must_use]
     pub fn must_instrument(&self, addr: GuestAddr) -> bool {
-        self.filter.allowed(addr)
+        self.filter.allowed(&addr)
     }
 
     fn on_ret<ET, S>(
+        qemu: Qemu,
         emulator_modules: &mut EmulatorModules<ET, S>,
         state: Option<&mut S>,
         pc: GuestAddr,
@@ -249,7 +252,7 @@ where
         S: Unpin + UsesInput,
         ET: EmulatorModuleTuple<S>,
     {
-        let ret_addr: GuestAddr = emulator_modules.qemu().read_return_address().unwrap();
+        let ret_addr: GuestAddr = qemu.read_return_address().unwrap();
 
         // log::info!("RET @ 0x{:#x}", ret_addr);
 
@@ -268,7 +271,9 @@ where
         emulator_modules.get_mut::<Self>().unwrap().collectors = collectors;
     }
 
+    #[allow(clippy::needless_pass_by_value)] // no longer a problem in nightly
     fn gen_blocks_calls<ET, S>(
+        qemu: Qemu,
         emulator_modules: &mut EmulatorModules<ET, S>,
         _state: Option<&mut S>,
         pc: GuestAddr,
@@ -291,25 +296,25 @@ where
             .unwrap();
         }
 
-        let qemu = emulator_modules.qemu();
-
         let mut call_addrs: Vec<(GuestAddr, usize)> = Vec::new();
         let mut ret_addrs: Vec<GuestAddr> = Vec::new();
 
         if let Some(h) = emulator_modules.modules().match_first_type::<Self>() {
-            #[allow(unused_mut)]
+            #[allow(unused_mut)] // cfg dependent
             let mut code = {
-                #[cfg(emulation_mode = "usermode")]
+                #[cfg(feature = "usermode")]
                 unsafe {
                     std::slice::from_raw_parts(qemu.g2h(pc), 512)
                 }
-                #[cfg(emulation_mode = "systemmode")]
+                #[cfg(feature = "systemmode")]
                 &mut [0; 512]
             };
-            #[cfg(emulation_mode = "systemmode")]
-            unsafe {
-                qemu.read_mem(pc, code)
-            }; // TODO handle faults
+            #[cfg(feature = "systemmode")]
+            if let Err(err) = qemu.read_mem(pc, code) {
+                // TODO handle faults
+                log::error!("gen_block_calls: Failed to read mem at pc {pc:#x}: {err:?}");
+                return None;
+            }
 
             let mut iaddr = pc;
 
@@ -341,21 +346,28 @@ where
 
                 iaddr += insn.bytes().len() as GuestAddr;
 
-                #[cfg(emulation_mode = "usermode")]
+                #[cfg(feature = "usermode")]
                 unsafe {
                     code = std::slice::from_raw_parts(qemu.g2h(iaddr), 512);
                 }
-                #[cfg(emulation_mode = "systemmode")]
-                unsafe {
-                    qemu.read_mem(pc, code);
-                } // TODO handle faults
+                #[cfg(feature = "systemmode")]
+                if let Err(err) = qemu.read_mem(pc, code) {
+                    // TODO handle faults
+                    log::error!(
+                        "gen_block_calls error 2: Failed to read mem at pc {pc:#x}: {err:?}"
+                    );
+                    return None;
+                }
             }
         }
 
         for (call_addr, call_len) in call_addrs {
             // TODO do not use a closure, find a more efficient way to pass call_len
             let call_cb = Box::new(
-                move |emulator_modules: &mut EmulatorModules<ET, S>, state: Option<&mut S>, pc| {
+                move |_qemu: Qemu,
+                      emulator_modules: &mut EmulatorModules<ET, S>,
+                      state: Option<&mut S>,
+                      pc| {
                     // eprintln!("CALL @ 0x{:#x}", pc + call_len);
                     let mut collectors = if let Some(h) = emulator_modules.get_mut::<Self>() {
                         h.collectors.take()
@@ -383,25 +395,16 @@ where
     }
 }
 
-impl<T> HasInstrumentationFilter<QemuInstrumentationAddressRangeFilter> for CallTracerModule<T>
-where
-    T: CallTraceCollectorTuple,
-{
-    fn filter(&self) -> &QemuInstrumentationAddressRangeFilter {
-        &self.filter
-    }
-
-    fn filter_mut(&mut self) -> &mut QemuInstrumentationAddressRangeFilter {
-        &mut self.filter
-    }
-}
-
 impl<S, T> EmulatorModule<S> for CallTracerModule<T>
 where
     S: Unpin + UsesInput,
     T: CallTraceCollectorTuple + Debug,
 {
-    fn init_module<ET>(&self, emulator_modules: &mut EmulatorModules<ET, S>)
+    type ModuleAddressFilter = StdAddressFilter;
+    #[cfg(feature = "systemmode")]
+    type ModulePageFilter = NopPageFilter;
+
+    fn post_qemu_init<ET>(&mut self, _qemu: Qemu, emulator_modules: &mut EmulatorModules<ET, S>)
     where
         ET: EmulatorModuleTuple<S>,
     {
@@ -412,32 +415,52 @@ where
         );
     }
 
-    fn pre_exec<ET>(&mut self, emulator_modules: &mut EmulatorModules<ET, S>, input: &S::Input)
-    where
+    fn pre_exec<ET>(
+        &mut self,
+        qemu: Qemu,
+        _emulator_modules: &mut EmulatorModules<ET, S>,
+        _state: &mut S,
+        input: &S::Input,
+    ) where
+        ET: EmulatorModuleTuple<S>,
+    {
+        self.collectors.as_mut().unwrap().pre_exec_all(qemu, input);
+    }
+
+    fn post_exec<OT, ET>(
+        &mut self,
+        qemu: Qemu,
+        _emulator_modules: &mut EmulatorModules<ET, S>,
+        _state: &mut S,
+        input: &S::Input,
+        observers: &mut OT,
+        exit_kind: &mut ExitKind,
+    ) where
+        OT: ObserversTuple<S::Input, S>,
         ET: EmulatorModuleTuple<S>,
     {
         self.collectors
             .as_mut()
             .unwrap()
-            .pre_exec_all(emulator_modules.qemu(), input);
+            .post_exec_all(qemu, input, observers, exit_kind);
     }
 
-    fn post_exec<OT, ET>(
-        &mut self,
-        emulator_modules: &mut EmulatorModules<ET, S>,
-        input: &S::Input,
-        observers: &mut OT,
-        exit_kind: &mut ExitKind,
-    ) where
-        OT: ObserversTuple<S>,
-        ET: EmulatorModuleTuple<S>,
-    {
-        self.collectors.as_mut().unwrap().post_exec_all(
-            emulator_modules.qemu(),
-            input,
-            observers,
-            exit_kind,
-        );
+    fn address_filter(&self) -> &Self::ModuleAddressFilter {
+        &self.filter
+    }
+
+    fn address_filter_mut(&mut self) -> &mut Self::ModuleAddressFilter {
+        &mut self.filter
+    }
+
+    #[cfg(feature = "systemmode")]
+    fn page_filter(&self) -> &Self::ModulePageFilter {
+        &NopPageFilter
+    }
+
+    #[cfg(feature = "systemmode")]
+    fn page_filter_mut(&mut self) -> &mut Self::ModulePageFilter {
+        unsafe { (&raw mut NOP_PAGE_FILTER).as_mut().unwrap().get_mut() }
     }
 }
 
@@ -471,7 +494,7 @@ impl<'a> CallTraceCollector for OnCrashBacktraceCollector<'a>
 where
     'a: 'static,
 {
-    #[allow(clippy::unnecessary_cast)]
+    #[expect(clippy::unnecessary_cast)]
     fn on_call<ET, S>(
         &mut self,
         _emulator_modules: &mut EmulatorModules<ET, S>,
@@ -485,7 +508,7 @@ where
         self.callstack_hash ^= pc as u64 + call_len as u64;
     }
 
-    #[allow(clippy::unnecessary_cast)]
+    #[expect(clippy::unnecessary_cast)]
     fn on_ret<ET, S>(
         &mut self,
         _emulator_modules: &mut EmulatorModules<ET, S>,
@@ -513,7 +536,7 @@ where
         observers: &mut OT,
         exit_kind: &mut ExitKind,
     ) where
-        OT: ObserversTuple<S>,
+        OT: ObserversTuple<S::Input, S>,
         S: Unpin + UsesInput,
     {
         let observer = observers
@@ -528,29 +551,36 @@ static mut CALLSTACKS: Option<ThreadLocal<UnsafeCell<Vec<GuestAddr>>>> = None;
 #[derive(Debug)]
 pub struct FullBacktraceCollector {}
 
-impl Default for FullBacktraceCollector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl FullBacktraceCollector {
-    pub fn new() -> Self {
-        unsafe { CALLSTACKS = Some(ThreadLocal::new()) };
+    /// # Safety
+    /// This accesses the global [`CALLSTACKS`] variable and may not be called concurrently.
+    #[expect(rustdoc::private_intra_doc_links)]
+    pub unsafe fn new() -> Self {
+        let callstacks_ptr = &raw mut CALLSTACKS;
+        unsafe { (*callstacks_ptr) = Some(ThreadLocal::new()) };
         Self {}
     }
 
     pub fn reset(&mut self) {
+        // # Safety
+        // This accesses the global [`CALLSTACKS`] variable.
+        // While it is racey, it might be fine if multiple clear the vecs concurrently.
+        // TODO: This should probably be rewritten in a safer way.
+        let callstacks_ptr = &raw mut CALLSTACKS;
         unsafe {
-            for tls in CALLSTACKS.as_mut().unwrap().iter_mut() {
+            for tls in (*callstacks_ptr).as_mut().unwrap().iter_mut() {
                 (*tls.get()).clear();
             }
         }
     }
 
     pub fn backtrace() -> Option<&'static [GuestAddr]> {
+        // # Safety
+        // This accesses the global [`CALLSTACKS`] variable.
+        // However, the actual variable access is behind a `ThreadLocal` class.
+        let callstacks_ptr = &raw mut CALLSTACKS;
         unsafe {
-            if let Some(c) = CALLSTACKS.as_mut() {
+            if let Some(c) = (*callstacks_ptr).as_mut() {
                 Some(&*c.get_or_default().get())
             } else {
                 None
@@ -560,7 +590,7 @@ impl FullBacktraceCollector {
 }
 
 impl CallTraceCollector for FullBacktraceCollector {
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(clippy::unnecessary_cast)] // dependent on the target instruction size
     fn on_call<ET, S>(
         &mut self,
         _emulator_modules: &mut EmulatorModules<ET, S>,
@@ -571,13 +601,15 @@ impl CallTraceCollector for FullBacktraceCollector {
         ET: EmulatorModuleTuple<S>,
         S: Unpin + UsesInput,
     {
+        let callstacks_ptr = &raw mut CALLSTACKS;
         // TODO handle Thumb
         unsafe {
-            (*CALLSTACKS.as_mut().unwrap().get_or_default().get()).push(pc + call_len as GuestAddr);
+            (*(*callstacks_ptr).as_mut().unwrap().get_or_default().get())
+                .push(pc + call_len as GuestAddr);
         }
     }
 
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(clippy::unnecessary_cast)] // dependent on the target instruction size
     fn on_ret<ET, S>(
         &mut self,
         _emulator_modules: &mut EmulatorModules<ET, S>,
@@ -588,8 +620,9 @@ impl CallTraceCollector for FullBacktraceCollector {
         ET: EmulatorModuleTuple<S>,
         S: Unpin + UsesInput,
     {
+        let callstacks_ptr = &raw mut CALLSTACKS;
         unsafe {
-            let v = &mut *CALLSTACKS.as_mut().unwrap().get_or_default().get();
+            let v = &mut *(*callstacks_ptr).as_mut().unwrap().get_or_default().get();
             if !v.is_empty() {
                 // if *v.last().unwrap() == ret_addr {
                 //    v.pop();

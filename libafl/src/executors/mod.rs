@@ -2,10 +2,10 @@
 
 #[cfg(unix)]
 use alloc::vec::Vec;
-use core::fmt::Debug;
+use core::{fmt::Debug, time::Duration};
 
 pub use combined::CombinedExecutor;
-#[cfg(all(feature = "std", any(unix, doc)))]
+#[cfg(all(feature = "std", unix))]
 pub use command::CommandExecutor;
 pub use differential::DiffExecutor;
 #[cfg(all(feature = "std", feature = "fork", unix))]
@@ -20,14 +20,10 @@ use serde::{Deserialize, Serialize};
 pub use shadow::ShadowExecutor;
 pub use with_observers::WithObservers;
 
-use crate::{
-    observers::{ObserversTuple, UsesObservers},
-    state::UsesState,
-    Error,
-};
+use crate::{state::UsesState, Error};
 
 pub mod combined;
-#[cfg(all(feature = "std", any(unix, doc)))]
+#[cfg(all(feature = "std", unix))]
 pub mod command;
 pub mod differential;
 #[cfg(all(feature = "std", feature = "fork", unix))]
@@ -49,7 +45,7 @@ pub mod hooks;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(
     any(not(feature = "serdeany_autoreg"), miri),
-    allow(clippy::unsafe_derive_deserialize)
+    expect(clippy::unsafe_derive_deserialize)
 )] // for SerdeAny
 pub enum ExitKind {
     /// The run exited normally.
@@ -75,7 +71,7 @@ pub enum ExitKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(
     any(not(feature = "serdeany_autoreg"), miri),
-    allow(clippy::unsafe_derive_deserialize)
+    expect(clippy::unsafe_derive_deserialize)
 )] // for SerdeAny
 pub enum DiffExitKind {
     /// The run exited normally.
@@ -109,7 +105,10 @@ impl From<ExitKind> for DiffExitKind {
 libafl_bolts::impl_serdeany!(DiffExitKind);
 
 /// Holds a tuple of Observers
-pub trait HasObservers: UsesObservers {
+pub trait HasObservers {
+    /// The observer
+    type Observers;
+
     /// Get the linked observers
     fn observers(&self) -> RefIndexable<&Self::Observers, Self::Observers>;
 
@@ -121,7 +120,6 @@ pub trait HasObservers: UsesObservers {
 pub trait Executor<EM, Z>: UsesState
 where
     EM: UsesState<State = Self::State>,
-    Z: UsesState<State = Self::State>,
 {
     /// Instruct the target about the input and run
     fn run_target(
@@ -131,18 +129,15 @@ where
         mgr: &mut EM,
         input: &Self::Input,
     ) -> Result<ExitKind, Error>;
+}
 
-    /// Wraps this Executor with the given [`ObserversTuple`] to implement [`HasObservers`].
-    ///
-    /// If the executor already implements [`HasObservers`], then the original implementation will be overshadowed by
-    /// the implementation of this wrapper.
-    fn with_observers<OT>(self, observers: OT) -> WithObservers<Self, OT>
-    where
-        Self: Sized,
-        OT: ObserversTuple<Self::State>,
-    {
-        WithObservers::new(self, observers)
-    }
+/// A trait that allows to get/set an `Executor`'s timeout thresold
+pub trait HasTimeout {
+    /// Get a timeout
+    fn timeout(&self) -> Duration;
+
+    /// Set timeout
+    fn set_timeout(&mut self, timeout: Duration);
 }
 
 /// The common signals we want to handle
@@ -165,7 +160,7 @@ pub fn common_signals() -> Vec<Signal> {
 }
 
 #[cfg(test)]
-pub mod test {
+mod test {
     use core::marker::PhantomData;
 
     use libafl_bolts::{AsSlice, Error};
@@ -173,7 +168,7 @@ pub mod test {
     use crate::{
         events::NopEventManager,
         executors::{Executor, ExitKind},
-        fuzzer::test::NopFuzzer,
+        fuzzer::NopFuzzer,
         inputs::{BytesInput, HasTargetBytes},
         state::{HasExecutions, NopState, State, UsesState},
     };
@@ -186,6 +181,7 @@ pub mod test {
     }
 
     impl<S> NopExecutor<S> {
+        /// Creates a new [`NopExecutor`]
         #[must_use]
         pub fn new() -> Self {
             Self {
@@ -212,7 +208,6 @@ pub mod test {
         EM: UsesState<State = S>,
         S: State + HasExecutions,
         S::Input: HasTargetBytes,
-        Z: UsesState<State = S>,
     {
         fn run_target(
             &mut self,

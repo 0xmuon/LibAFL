@@ -15,7 +15,8 @@ use libafl::{
     inputs::{BytesInput, HasTargetBytes},
     monitors::MultiMonitor,
     mutators::{
-        scheduled::{havoc_mutations, tokens_mutations, StdScheduledMutator},
+        havoc_mutations::havoc_mutations,
+        scheduled::{tokens_mutations, StdScheduledMutator},
         token_mutations::{I2SRandReplace, Tokens},
     },
     observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
@@ -26,6 +27,7 @@ use libafl::{
 };
 use libafl_bolts::{
     core_affinity::Cores,
+    nonzero,
     ownedref::OwnedMutSlice,
     rands::StdRand,
     shmem::{ShMemProvider, StdShMemProvider},
@@ -107,13 +109,12 @@ where
     }
 }
 
-#[allow(clippy::similar_names)]
-impl<'a, H> InMemoryBytesCoverageSugar<'a, H>
+impl<H> InMemoryBytesCoverageSugar<'_, H>
 where
     H: FnMut(&[u8]),
 {
     /// Run the fuzzer
-    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    #[expect(clippy::too_many_lines)]
     pub fn run(&mut self) {
         let conf = match self.configuration.as_ref() {
             Some(name) => EventConfig::from_name(name),
@@ -228,7 +229,7 @@ where
             if state.must_load_initial_inputs() {
                 if self.input_dirs.is_empty() {
                     // Generator of printable bytearrays of max size 32
-                    let mut generator = RandBytesGenerator::new(32);
+                    let mut generator = RandBytesGenerator::new(nonzero!(32));
 
                     // Generate 8 initial inputs
                     state
@@ -391,7 +392,7 @@ pub mod pybind {
     impl InMemoryBytesCoverageSugar {
         /// Create a new [`InMemoryBytesCoverageSugar`]
         #[new]
-        #[allow(clippy::too_many_arguments)]
+        #[expect(clippy::too_many_arguments)]
         #[pyo3(signature = (
             input_dirs,
             output_dir,
@@ -425,7 +426,7 @@ pub mod pybind {
         }
 
         /// Run the fuzzer
-        #[allow(clippy::needless_pass_by_value)]
+        #[expect(clippy::needless_pass_by_value)]
         pub fn run(&self, harness: PyObject) {
             inmemory::InMemoryBytesCoverageSugar::builder()
                 .input_dirs(&self.input_dirs)
@@ -434,7 +435,7 @@ pub mod pybind {
                 .cores(&self.cores)
                 .harness(|buf| {
                     Python::with_gil(|py| -> PyResult<()> {
-                        let args = (PyBytes::new_bound(py, buf),); // TODO avoid copy
+                        let args = (PyBytes::new(py, buf),); // TODO avoid copy
                         harness.call1(py, args)?;
                         Ok(())
                     })

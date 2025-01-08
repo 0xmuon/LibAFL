@@ -14,13 +14,15 @@ use libafl::{
 };
 use libafl_qemu_sys::{GuestAddr, GuestPhysAddr, GuestUsize, GuestVirtAddr};
 
+#[cfg(doc)]
+use crate::modules::EmulatorModule;
 use crate::{
     breakpoint::{Breakpoint, BreakpointId},
     command::{CommandError, CommandManager, NopCommandManager, StdCommandManager},
-    modules::{EmulatorModuleTuple, StdInstrumentationFilter},
-    sync_exit::SyncExit,
-    Qemu, QemuExitError, QemuExitReason, QemuInitError, QemuMemoryChunk, QemuShutdownCause, Regs,
-    CPU,
+    modules::EmulatorModuleTuple,
+    sync_exit::CustomInsn,
+    Qemu, QemuExitError, QemuExitReason, QemuHooks, QemuInitError, QemuMemoryChunk, QemuParams,
+    QemuShutdownCause, Regs, CPU,
 };
 
 mod hooks;
@@ -35,15 +37,17 @@ pub use drivers::*;
 mod snapshot;
 pub use snapshot::*;
 
-#[cfg(emulation_mode = "usermode")]
+#[cfg(feature = "usermode")]
 mod usermode;
-#[cfg(emulation_mode = "usermode")]
+#[cfg(feature = "usermode")]
 pub use usermode::*;
 
-#[cfg(emulation_mode = "systemmode")]
+#[cfg(feature = "systemmode")]
 mod systemmode;
-#[cfg(emulation_mode = "systemmode")]
+#[cfg(feature = "systemmode")]
 pub use systemmode::*;
+
+use crate::config::QemuConfigBuilder;
 
 #[derive(Clone, Copy)]
 pub enum GuestAddrKind {
@@ -58,7 +62,8 @@ where
 {
     QemuExit(QemuShutdownCause),               // QEMU ended for some reason.
     Breakpoint(Breakpoint<CM, ED, ET, S, SM>), // Breakpoint triggered. Contains the address of the trigger.
-    SyncExit(SyncExit<CM, ED, ET, S, SM>), // Synchronous backdoor: The guest triggered a backdoor and should return to LibAFL.
+    CustomInsn(CustomInsn<CM, ED, ET, S, SM>), // Synchronous backdoor: The guest triggered a backdoor and should return to LibAFL.
+    Timeout,                                   // Timeout
 }
 
 impl<CM, ED, ET, S, SM> Clone for EmulatorExitResult<CM, ED, ET, S, SM>
@@ -72,9 +77,10 @@ where
                 EmulatorExitResult::QemuExit(qemu_exit.clone())
             }
             EmulatorExitResult::Breakpoint(bp) => EmulatorExitResult::Breakpoint(bp.clone()),
-            EmulatorExitResult::SyncExit(sync_exit) => {
-                EmulatorExitResult::SyncExit(sync_exit.clone())
+            EmulatorExitResult::CustomInsn(sync_exit) => {
+                EmulatorExitResult::CustomInsn(sync_exit.clone())
             }
+            EmulatorExitResult::Timeout => EmulatorExitResult::Timeout,
         }
     }
 }
@@ -84,7 +90,7 @@ where
     CM: CommandManager<ED, ET, S, SM>,
     S: UsesInput,
 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             EmulatorExitResult::QemuExit(qemu_exit) => {
                 write!(f, "{qemu_exit:?}")
@@ -92,8 +98,11 @@ where
             EmulatorExitResult::Breakpoint(bp) => {
                 write!(f, "{bp:?}")
             }
-            EmulatorExitResult::SyncExit(sync_exit) => {
+            EmulatorExitResult::CustomInsn(sync_exit) => {
                 write!(f, "{sync_exit:?}")
+            }
+            EmulatorExitResult::Timeout => {
+                write!(f, "Timeout")
             }
         }
     }
@@ -113,8 +122,25 @@ pub struct InputLocation {
     ret_register: Option<Regs>,
 }
 
+/// The high-level interface to [`Qemu`].
+///
+/// It embeds multiple structures aiming at making QEMU usage easier:
+///
+/// - An [`IsSnapshotManager`] implementation, implementing the QEMU snapshot method to use.
+/// - An [`EmulatorDriver`] implementation, responsible for handling the high-level control flow of QEMU runtime.
+/// - A [`CommandManager`] implementation, handling the commands received from the target.
+/// - [`EmulatorModules`], containing the [`EmulatorModule`] implementations' state.
+///
+/// Each of these fields can be set manually to finely tune how QEMU is getting handled.
+/// It is highly encouraged to build [`Emulator`] using the associated [`EmulatorBuilder`].
+/// There are two main functions to access the builder:
+///
+/// - [`Emulator::builder`] gives access to the standard [`EmulatorBuilder`], embedding all the standard components of an [`Emulator`].
+/// - [`Emulator::empty`] gives access to an empty [`EmulatorBuilder`]. This is mostly useful to create a more custom [`Emulator`].
+///
+/// Please check the documentation of [`EmulatorBuilder`] for more details.
 #[derive(Debug)]
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 pub struct Emulator<CM, ED, ET, S, SM>
 where
     CM: CommandManager<ED, ET, S, SM>,
@@ -123,11 +149,10 @@ where
     snapshot_manager: SM,
     modules: Pin<Box<EmulatorModules<ET, S>>>,
     command_manager: CM,
-    driver: Option<ED>,
+    driver: ED,
     breakpoints_by_addr: RefCell<HashMap<GuestAddr, Breakpoint<CM, ED, ET, S, SM>>>, // TODO: change to RC here
     breakpoints_by_id: RefCell<HashMap<BreakpointId, Breakpoint<CM, ED, ET, S, SM>>>,
     qemu: Qemu,
-    first_exec: bool,
 }
 
 impl<CM, ED, ET, S, SM> EmulatorDriverResult<CM, ED, ET, S, SM>
@@ -136,7 +161,7 @@ where
     S: UsesInput,
 {
     #[must_use]
-    #[allow(clippy::match_wildcard_for_single_variants)]
+    #[expect(clippy::match_wildcard_for_single_variants)]
     pub fn end_of_run(&self) -> Option<ExitKind> {
         match self {
             EmulatorDriverResult::EndOfRun(exit_kind) => Some(*exit_kind),
@@ -146,10 +171,10 @@ where
 }
 
 impl Debug for GuestAddrKind {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            GuestAddrKind::Physical(paddr) => write!(f, "vaddr {paddr:x}"),
-            GuestAddrKind::Virtual(vaddr) => write!(f, "paddr {vaddr:x}"),
+            GuestAddrKind::Physical(paddr) => write!(f, "paddr {paddr:#x}"),
+            GuestAddrKind::Virtual(vaddr) => write!(f, "vaddr {vaddr:#x}"),
         }
     }
 }
@@ -195,6 +220,16 @@ impl InputLocation {
             ret_register,
         }
     }
+
+    #[must_use]
+    pub fn mem_chunk(&self) -> &QemuMemoryChunk {
+        &self.mem_chunk
+    }
+
+    #[must_use]
+    pub fn ret_register(&self) -> &Option<Regs> {
+        &self.ret_register
+    }
 }
 
 impl From<EmulatorExitError> for EmulatorDriverError {
@@ -218,8 +253,11 @@ where
         match self {
             EmulatorExitResult::QemuExit(shutdown_cause) => write!(f, "End: {shutdown_cause:?}"),
             EmulatorExitResult::Breakpoint(bp) => write!(f, "{bp}"),
-            EmulatorExitResult::SyncExit(sync_exit) => {
+            EmulatorExitResult::CustomInsn(sync_exit) => {
                 write!(f, "Sync exit: {sync_exit:?}")
+            }
+            EmulatorExitResult::Timeout => {
+                write!(f, "Timeout")
             }
         }
     }
@@ -236,8 +274,14 @@ where
     S: UsesInput,
 {
     #[must_use]
-    pub fn empty(
-    ) -> EmulatorBuilder<NopCommandManager, NopEmulatorDriver, (), S, NopSnapshotManager> {
+    pub fn empty() -> EmulatorBuilder<
+        NopCommandManager,
+        NopEmulatorDriver,
+        (),
+        QemuConfigBuilder,
+        S,
+        NopSnapshotManager,
+    > {
         EmulatorBuilder::empty()
     }
 }
@@ -248,8 +292,14 @@ where
     S::Input: HasTargetBytes,
 {
     #[must_use]
-    pub fn builder(
-    ) -> EmulatorBuilder<StdCommandManager<S>, StdEmulatorDriver, (), S, StdSnapshotManager> {
+    pub fn builder() -> EmulatorBuilder<
+        StdCommandManager<S>,
+        StdEmulatorDriver,
+        (),
+        QemuConfigBuilder,
+        S,
+        StdSnapshotManager,
+    > {
         EmulatorBuilder::default()
     }
 }
@@ -270,12 +320,12 @@ where
 
     #[must_use]
     pub fn driver(&self) -> &ED {
-        self.driver.as_ref().unwrap()
+        &self.driver
     }
 
     #[must_use]
     pub fn driver_mut(&mut self) -> &mut ED {
-        self.driver.as_mut().unwrap()
+        &mut self.driver
     }
 
     #[must_use]
@@ -286,6 +336,14 @@ where
     #[must_use]
     pub fn snapshot_manager_mut(&mut self) -> &mut SM {
         &mut self.snapshot_manager
+    }
+
+    pub fn command_manager(&self) -> &CM {
+        &self.command_manager
+    }
+
+    pub fn command_manager_mut(&mut self) -> &mut CM {
+        &mut self.command_manager
     }
 }
 
@@ -307,57 +365,68 @@ where
     S: UsesInput + Unpin,
 {
     #[allow(clippy::must_use_candidate, clippy::similar_names)]
-    pub fn new(
-        qemu_args: &[String],
-        modules: ET,
-        drivers: ED,
-        snapshot_manager: SM,
-        command_manager: CM,
-    ) -> Result<Self, QemuInitError> {
-        let qemu = Qemu::init(qemu_args)?;
-
-        Self::new_with_qemu(qemu, modules, drivers, snapshot_manager, command_manager)
-    }
-
-    pub fn new_with_qemu(
-        qemu: Qemu,
+    pub fn new<T>(
+        qemu_params: T,
         modules: ET,
         driver: ED,
         snapshot_manager: SM,
         command_manager: CM,
-    ) -> Result<Self, QemuInitError> {
-        Ok(Emulator {
-            modules: EmulatorModules::new(qemu, modules),
-            command_manager,
-            snapshot_manager,
-            driver: Some(driver),
-            breakpoints_by_addr: RefCell::new(HashMap::new()),
-            breakpoints_by_id: RefCell::new(HashMap::new()),
-            first_exec: true,
-            qemu,
-        })
-    }
+    ) -> Result<Self, QemuInitError>
+    where
+        T: Into<QemuParams>,
+    {
+        let mut qemu_params = qemu_params.into();
 
-    pub fn first_exec_all(&mut self) {
-        if self.first_exec {
-            self.modules.first_exec_all();
-            self.first_exec = false;
+        let emulator_hooks = unsafe { EmulatorHooks::new(QemuHooks::get_unchecked()) };
+        let mut emulator_modules = EmulatorModules::new(emulator_hooks, modules);
+
+        // TODO: fix things there properly. The biggest issue being that it creates 2 mut ref to the module with the callback being called
+        unsafe {
+            emulator_modules.modules_mut().pre_qemu_init_all(
+                EmulatorModules::<ET, S>::emulator_modules_mut_unchecked(),
+                &mut qemu_params,
+            );
+        }
+
+        let qemu = Qemu::init(qemu_params)?;
+
+        unsafe {
+            Ok(Self::new_with_qemu(
+                qemu,
+                emulator_modules,
+                driver,
+                snapshot_manager,
+                command_manager,
+            ))
         }
     }
 
-    pub fn pre_exec_all(&mut self, input: &S::Input) {
-        self.modules.pre_exec_all(input);
-    }
+    /// New emulator with already initialized QEMU.
+    /// We suppose modules init hooks have already been run.
+    ///
+    /// # Safety
+    ///
+    /// pre-init qemu hooks should be run before calling this.
+    unsafe fn new_with_qemu(
+        qemu: Qemu,
+        emulator_modules: Pin<Box<EmulatorModules<ET, S>>>,
+        driver: ED,
+        snapshot_manager: SM,
+        command_manager: CM,
+    ) -> Self {
+        let mut emulator = Emulator {
+            modules: emulator_modules,
+            command_manager,
+            snapshot_manager,
+            driver,
+            breakpoints_by_addr: RefCell::new(HashMap::new()),
+            breakpoints_by_id: RefCell::new(HashMap::new()),
+            qemu,
+        };
 
-    pub fn post_exec_all<OT>(
-        &mut self,
-        input: &S::Input,
-        observers: &mut OT,
-        exit_kind: &mut ExitKind,
-    ) where
-        OT: ObserversTuple<S>,
-    {
-        self.modules.post_exec_all(input, observers, exit_kind);
+        emulator.modules.post_qemu_init_all(qemu);
+
+        emulator
     }
 }
 
@@ -365,8 +434,8 @@ impl<CM, ED, ET, S, SM> Emulator<CM, ED, ET, S, SM>
 where
     CM: CommandManager<ED, ET, S, SM>,
     ED: EmulatorDriver<CM, ET, S, SM>,
-    ET: StdInstrumentationFilter + Unpin,
-    S: UsesInput,
+    ET: EmulatorModuleTuple<S> + Unpin,
+    S: UsesInput + Unpin,
 {
     /// This function will run the emulator until the exit handler decides to stop the execution for
     /// whatever reason, depending on the choosen handler.
@@ -378,20 +447,22 @@ where
     /// Of course, the emulated target is not contained securely and can corrupt state or interact with the operating system.
     pub unsafe fn run(
         &mut self,
+        state: &mut S,
         input: &S::Input,
     ) -> Result<EmulatorDriverResult<CM, ED, ET, S, SM>, EmulatorDriverError> {
-        let mut driver = self.driver.take().unwrap();
-
         loop {
             // Insert input if the location is already known
-            driver.pre_exec(self, input);
+            ED::pre_qemu_exec(self, input);
 
             // Run QEMU
+            log::debug!("Running QEMU...");
             let mut exit_reason = self.run_qemu();
+            log::debug!("QEMU stopped.");
 
             // Handle QEMU exit
-            if let Some(exit_handler_result) = driver.post_exec(self, &mut exit_reason, input)? {
-                self.driver = Some(driver);
+            if let Some(exit_handler_result) =
+                ED::post_qemu_exec(self, state, &mut exit_reason, input)?
+            {
                 return Ok(exit_handler_result);
             }
         }
@@ -410,6 +481,7 @@ where
                 QemuExitReason::End(qemu_shutdown_cause) => {
                     EmulatorExitResult::QemuExit(qemu_shutdown_cause)
                 }
+                QemuExitReason::Timeout => EmulatorExitResult::Timeout,
                 QemuExitReason::Breakpoint(bp_addr) => {
                     let bp = self
                         .breakpoints_by_addr
@@ -419,7 +491,7 @@ where
                         .clone();
                     EmulatorExitResult::Breakpoint(bp.clone())
                 }
-                QemuExitReason::SyncExit => EmulatorExitResult::SyncExit(SyncExit::new(
+                QemuExitReason::SyncExit => EmulatorExitResult::CustomInsn(CustomInsn::new(
                     self.command_manager.parse(self.qemu)?,
                 )),
             }),
@@ -429,9 +501,31 @@ where
             }),
         }
     }
+
+    /// First exec of Emulator, called before calling to user harness the first time
+    pub fn first_exec(&mut self, state: &mut S) {
+        ED::first_harness_exec(self, state);
+    }
+
+    /// Pre exec of Emulator, called before calling to user harness
+    pub fn pre_exec(&mut self, state: &mut S, input: &S::Input) {
+        ED::pre_harness_exec(self, state, input);
+    }
+
+    /// Post exec of Emulator, called before calling to user harness
+    pub fn post_exec<OT>(
+        &mut self,
+        input: &S::Input,
+        observers: &mut OT,
+        state: &mut S,
+        exit_kind: &mut ExitKind,
+    ) where
+        OT: ObserversTuple<S::Input, S>,
+    {
+        ED::post_harness_exec(self, input, observers, state, exit_kind);
+    }
 }
 
-#[allow(clippy::unused_self)]
 impl<CM, ED, ET, S, SM> Emulator<CM, ED, ET, S, SM>
 where
     CM: CommandManager<ED, ET, S, SM>,

@@ -11,7 +11,7 @@ use libafl::{
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::BytesInput,
     monitors::SimpleMonitor,
-    mutators::{scheduled::havoc_mutations, tokens_mutations, StdScheduledMutator, Tokens},
+    mutators::{havoc_mutations, tokens_mutations, StdScheduledMutator, Tokens},
     observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::mutational::StdMutationalStage,
@@ -83,7 +83,6 @@ struct Opt {
     signal: Signal,
 }
 
-#[allow(clippy::similar_names)]
 pub fn main() {
     env_logger::init();
     const MAP_SIZE: usize = 65536;

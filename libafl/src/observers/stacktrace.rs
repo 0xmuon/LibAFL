@@ -17,7 +17,7 @@ use std::{
 
 use backtrace::Backtrace;
 use libafl_bolts::{ownedref::OwnedRefMut, Named};
-#[allow(unused_imports)]
+#[allow(unused_imports)] // expect breaks here for some reason
 #[cfg(feature = "casr")]
 use libcasr::{
     asan::AsanStacktrace,
@@ -39,7 +39,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::ObserverWithHashField;
-use crate::{executors::ExitKind, inputs::UsesInput, observers::Observer, Error};
+use crate::{executors::ExitKind, observers::Observer, Error};
 
 #[cfg(not(feature = "casr"))]
 /// Collects the backtrace via [`Backtrace`] and [`Debug`]
@@ -111,7 +111,6 @@ pub enum HarnessType {
 }
 
 /// An observer looking at the backtrace after the harness crashes
-#[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BacktraceObserver<'a> {
     observer_name: Cow<'static, str>,
@@ -188,7 +187,7 @@ impl<'a> BacktraceObserver<'a> {
     }
 }
 
-impl<'a> ObserverWithHashField for BacktraceObserver<'a> {
+impl ObserverWithHashField for BacktraceObserver<'_> {
     /// Gets the hash value of this observer.
     #[must_use]
     fn hash(&self) -> Option<u64> {
@@ -196,16 +195,8 @@ impl<'a> ObserverWithHashField for BacktraceObserver<'a> {
     }
 }
 
-impl<'a, S> Observer<S> for BacktraceObserver<'a>
-where
-    S: UsesInput,
-{
-    fn post_exec(
-        &mut self,
-        _state: &mut S,
-        _input: &S::Input,
-        exit_kind: &ExitKind,
-    ) -> Result<(), Error> {
+impl<I, S> Observer<I, S> for BacktraceObserver<'_> {
+    fn post_exec(&mut self, _state: &mut S, _input: &I, exit_kind: &ExitKind) -> Result<(), Error> {
         if self.harness_type == HarnessType::InProcess {
             if *exit_kind == ExitKind::Crash {
                 self.update_hash(collect_backtrace());
@@ -218,22 +209,15 @@ where
 
     fn post_exec_child(
         &mut self,
-        _state: &mut S,
-        _input: &S::Input,
+        state: &mut S,
+        input: &I,
         exit_kind: &ExitKind,
     ) -> Result<(), Error> {
-        if self.harness_type == HarnessType::Child {
-            if *exit_kind == ExitKind::Crash {
-                self.update_hash(collect_backtrace());
-            } else {
-                self.clear_hash();
-            }
-        }
-        Ok(())
+        self.post_exec(state, input, exit_kind)
     }
 }
 
-impl<'a> Named for BacktraceObserver<'a> {
+impl Named for BacktraceObserver<'_> {
     fn name(&self) -> &Cow<'static, str> {
         &self.observer_name
     }
@@ -373,23 +357,7 @@ impl Default for AsanBacktraceObserver {
     }
 }
 
-impl<S> Observer<S> for AsanBacktraceObserver
-where
-    S: UsesInput,
-{
-    fn pre_exec(&mut self, _state: &mut S, _input: &S::Input) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn post_exec(
-        &mut self,
-        _state: &mut S,
-        _input: &S::Input,
-        _exit_kind: &ExitKind,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-}
+impl<I, S> Observer<I, S> for AsanBacktraceObserver {}
 
 impl Named for AsanBacktraceObserver {
     fn name(&self) -> &Cow<'static, str> {

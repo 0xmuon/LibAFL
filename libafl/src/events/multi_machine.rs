@@ -32,7 +32,7 @@ use crate::{
     inputs::{Input, NopInput},
 };
 
-const MAX_NB_RECEIVED_AT_ONCE: usize = 10;
+// const MAX_NB_RECEIVED_AT_ONCE: usize = 100;
 
 #[bitflags(default = SendToParent | SendToChildren)]
 #[repr(u8)]
@@ -63,8 +63,8 @@ where
 }
 
 /// We do not use raw pointers, so no problem with thead-safety
-unsafe impl<'a, I: Input> Send for MultiMachineMsg<'a, I> {}
-unsafe impl<'a, I: Input> Sync for MultiMachineMsg<'a, I> {}
+unsafe impl<I: Input> Send for MultiMachineMsg<'_, I> {}
+unsafe impl<I: Input> Sync for MultiMachineMsg<'_, I> {}
 
 impl<'a, I> MultiMachineMsg<'a, I>
 where
@@ -122,7 +122,6 @@ impl NodeId {
 
 /// The state of the hook shared between the background threads and the main thread.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct TcpMultiMachineState<A> {
     node_descriptor: NodeDescriptor<A>,
     /// the parent to which the testcases should be forwarded when deemed interesting
@@ -364,7 +363,7 @@ where
     /// Read a [`TcpMultiMachineMsg`] from a stream.
     /// Expects a message written by [`TcpMultiMachineState::write_msg`].
     /// If there is nothing to read from the stream, return asap with Ok(None).
-    #[allow(clippy::uninit_vec)]
+    #[expect(clippy::uninit_vec)]
     async fn read_msg<'a, I: Input + 'a>(
         stream: &mut TcpStream,
     ) -> Result<Option<MultiMachineMsg<'a, I>>, Error> {
@@ -394,7 +393,9 @@ where
 
         // 1. Read msg size
         let mut node_msg_len: [u8; 4] = [0; 4];
+        log::debug!("Receiving msg len...");
         stream.read_exact(&mut node_msg_len).await?;
+        log::debug!("msg len received.");
         let node_msg_len = u32::from_le_bytes(node_msg_len) as usize;
 
         // 2. Read msg
@@ -404,7 +405,9 @@ where
         unsafe {
             node_msg.set_len(node_msg_len);
         }
+        log::debug!("Receiving msg...");
         stream.read_exact(node_msg.as_mut_slice()).await?;
+        log::debug!("msg received.");
         let node_msg = node_msg.into_boxed_slice();
 
         Ok(Some(MultiMachineMsg::from_llmp_msg(node_msg)))
@@ -420,16 +423,19 @@ where
         let msg_len = u32::to_le_bytes(serialized_msg.len() as u32);
 
         // 0. Write the dummy byte
-        log::debug!("Sending dummy byte");
+        log::debug!("Sending dummy byte...");
         stream.write_all(&[DUMMY_BYTE]).await?;
+        log::debug!("dummy byte sent.");
 
         // 1. Write msg size
-        log::debug!("Sending msg len");
+        log::debug!("Sending msg len...");
         stream.write_all(&msg_len).await?;
+        log::debug!("msg len sent.");
 
         // 2. Write msg
-        log::debug!("Sending msg");
+        log::debug!("Sending msg...");
         stream.write_all(serialized_msg).await?;
+        log::debug!("msg sent.");
 
         Ok(())
     }
@@ -483,11 +489,11 @@ where
         {
             let mut ids_to_remove: Vec<NodeId> = Vec::new();
             for (child_id, child_stream) in &mut self.children {
-                log::debug!("Sending to child...");
-                if (Self::write_msg(child_stream, msg).await).is_err() {
+                log::debug!("Sending to child {child_id:?}...");
+                if let Err(err) = Self::write_msg(child_stream, msg).await {
                     // most likely the child disconnected. drop the connection later on and continue.
                     log::debug!(
-                        "The child disconnected. We won't try to communicate with it again."
+                        "The child disconnected. We won't try to communicate with it again. Error: {err:?}"
                     );
                     ids_to_remove.push(*child_id);
                 }
@@ -510,15 +516,17 @@ where
         msgs: &mut Vec<MultiMachineMsg<'a, I>>,
     ) -> Result<(), Error> {
         log::debug!("Checking for new events from other nodes...");
-        let mut nb_received = 0usize;
+        // let mut nb_received = 0usize;
 
         // Our (potential) parent could have something for us
         if let Some(parent) = &mut self.parent {
             loop {
                 // Exit if received a lot of inputs at once.
-                if nb_received > MAX_NB_RECEIVED_AT_ONCE {
-                    return Ok(());
-                }
+                // TODO: this causes problems in some cases, it could freeze all fuzzer instances.
+                // if nb_received > MAX_NB_RECEIVED_AT_ONCE {
+                //     log::debug!("hitting MAX_NB_RECEIVED_AT_ONCE limit...");
+                //     return Ok(());
+                // }
 
                 log::debug!("Receiving from parent...");
                 match Self::read_msg(parent).await {
@@ -526,7 +534,7 @@ where
                         log::debug!("Received event from parent");
                         // The parent has something for us, we store it
                         msgs.push(msg);
-                        nb_received += 1;
+                        // nb_received += 1;
                     }
 
                     Ok(None) => {
@@ -562,17 +570,17 @@ where
         for (child_id, child_stream) in &mut self.children {
             loop {
                 // Exit if received a lot of inputs at once.
-                if nb_received > MAX_NB_RECEIVED_AT_ONCE {
-                    return Ok(());
-                }
+                // if nb_received > MAX_NB_RECEIVED_AT_ONCE {
+                //    return Ok(());
+                //}
 
-                log::debug!("Receiving from child {:?}...", child_id);
+                log::debug!("Receiving from child {child_id:?}...");
                 match Self::read_msg(child_stream).await {
                     Ok(Some(msg)) => {
                         // The parent has something for us, we store it
                         log::debug!("Received event from child!");
                         msgs.push(msg);
-                        nb_received += 1;
+                        // nb_received += 1;
                     }
 
                     Ok(None) => {
@@ -584,7 +592,7 @@ where
                     Err(Error::OsError(e, _, _)) => {
                         // most likely the parent disconnected. drop the connection
                         log::error!(
-                            "The parent disconnected. We won't try to communicate with it again."
+                            "The child disconnected. We won't try to communicate with it again."
                         );
                         log::error!("Error: {e:?}");
                         ids_to_remove.push(*child_id);

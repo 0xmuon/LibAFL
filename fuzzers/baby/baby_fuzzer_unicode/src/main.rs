@@ -24,14 +24,17 @@ use libafl_bolts::{rands::StdRand, tuples::tuple_list, AsSlice};
 
 /// Coverage map with explicit assignments due to the lack of instrumentation
 static mut SIGNALS: [u8; 64] = [0; 64];
-static mut SIGNALS_PTR: *mut u8 = unsafe { SIGNALS.as_mut_ptr() };
+static mut SIGNALS_PTR: *mut u8 = (&raw mut SIGNALS).cast();
+// TODO: This will break soon, fix me! See https://github.com/AFLplusplus/LibAFL/issues/2786
+#[allow(static_mut_refs)] // only a problem in nightly
+static mut SIGNALS_LEN: usize = unsafe { SIGNALS.len() };
 
 /// Assign a signal to the signals map
 fn signals_set(idx: usize) {
     unsafe { write(SIGNALS_PTR.add(idx), 1) };
 }
 
-#[allow(clippy::similar_names, clippy::manual_assert)]
+#[expect(clippy::manual_assert)]
 pub fn main() {
     // The closure that we want to fuzz
     let mut harness = |input: &BytesInput| {
@@ -56,7 +59,7 @@ pub fn main() {
     };
 
     // Create an observation channel using the signals map
-    let observer = unsafe { StdMapObserver::from_mut_ptr("signals", SIGNALS_PTR, SIGNALS.len()) };
+    let observer = unsafe { StdMapObserver::from_mut_ptr("signals", SIGNALS_PTR, SIGNALS_LEN) };
 
     // Feedback to rate the interestingness of an input
     let mut feedback = MaxMapFeedback::new(&observer);

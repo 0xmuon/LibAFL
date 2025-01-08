@@ -1,22 +1,20 @@
 #![allow(clippy::missing_transmute_annotations)]
 
-#[cfg(emulation_mode = "usermode")]
-use std::ptr::addr_of_mut;
 use std::{fmt::Debug, marker::PhantomData, mem::transmute, pin::Pin, ptr};
 
 use libafl::{executors::ExitKind, inputs::UsesInput, observers::ObserversTuple};
-use libafl_qemu_sys::{CPUArchStatePtr, CPUStatePtr, FatPtr, GuestAddr, GuestUsize, TCGTemp};
+use libafl_qemu_sys::{CPUStatePtr, FatPtr, GuestAddr, GuestUsize, TCGTemp};
 
-#[cfg(emulation_mode = "usermode")]
+#[cfg(feature = "usermode")]
 use crate::qemu::{
     closure_post_syscall_hook_wrapper, closure_pre_syscall_hook_wrapper,
     func_post_syscall_hook_wrapper, func_pre_syscall_hook_wrapper, PostSyscallHook,
-    PostSyscallHookId, PreSyscallHook, PreSyscallHookId, SyscallHookResult,
+    PostSyscallHookId, PreSyscallHook, PreSyscallHookId,
 };
-#[cfg(emulation_mode = "usermode")]
+#[cfg(feature = "usermode")]
 use crate::qemu::{
-    CrashHookClosure, PostSyscallHookClosure, PostSyscallHookFn, PreSyscallHookClosure,
-    PreSyscallHookFn,
+    CrashHookClosure, CrashHookFn, PostSyscallHookClosure, PostSyscallHookFn,
+    PreSyscallHookClosure, PreSyscallHookFn,
 };
 use crate::{
     cpu_run_post_exec_hook_wrapper, cpu_run_pre_exec_hook_wrapper,
@@ -39,9 +37,15 @@ use crate::{
         ReadExecNHook, ReadGenHook, ReadHookId, TcgHookState, WriteExecHook, WriteExecNHook,
         WriteGenHook, WriteHookId,
     },
-    CpuPostRunHook, CpuPreRunHook, CpuRunHookId, HookState, MemAccessInfo, Qemu,
+    CpuPostRunHook, CpuPreRunHook, CpuRunHookId, HookState, MemAccessInfo, NewThreadHookFn, Qemu,
 };
 
+/// Get a C-compatible function pointer from the input hook.
+/// If the hook was already a c function, nothing is done.
+///
+/// h: input hook
+/// replacement: C-compatible function to call when C side should call the hook
+/// fntype: type used to cast h into replacement
 macro_rules! get_raw_hook {
     ($h:expr, $replacement:expr, $fntype:ty) => {
         match $h {
@@ -66,29 +70,30 @@ macro_rules! hook_to_repr {
     };
 }
 
-static mut EMULATOR_TOOLS: *mut () = ptr::null_mut();
+static mut EMULATOR_MODULES: *mut () = ptr::null_mut();
 
-#[cfg(emulation_mode = "usermode")]
-static mut CRASH_HOOKS: Vec<HookRepr> = vec![];
-
-#[cfg(emulation_mode = "usermode")]
+#[cfg(feature = "usermode")]
 pub extern "C" fn crash_hook_wrapper<ET, S>(target_sig: i32)
 where
     ET: EmulatorModuleTuple<S>,
     S: Unpin + UsesInput,
 {
     unsafe {
-        let hooks = Qemu::get().unwrap().hooks();
+        let emulator_modules = EmulatorModules::<ET, S>::emulator_modules_mut().unwrap();
+        let qemu = Qemu::get_unchecked();
 
-        for crash_hook in &mut (*addr_of_mut!(CRASH_HOOKS)) {
+        let crash_hooks_ptr = &raw mut emulator_modules.hooks.crash_hooks;
+
+        for crash_hook in &mut (*crash_hooks_ptr) {
             match crash_hook {
                 HookRepr::Function(ptr) => {
-                    let func: fn(QemuHooks, i32) = transmute(*ptr);
-                    func(hooks, target_sig);
+                    let func: CrashHookFn<ET, S> = transmute(*ptr);
+                    func(qemu, emulator_modules, target_sig);
                 }
                 HookRepr::Closure(ptr) => {
-                    let func: &mut Box<dyn FnMut(QemuHooks, i32)> = transmute(ptr);
-                    func(hooks, target_sig);
+                    let func: &mut CrashHookClosure<ET, S> =
+                        &mut *(ptr::from_mut::<FatPtr>(ptr) as *mut CrashHookClosure<ET, S>);
+                    func(qemu, emulator_modules, target_sig);
                 }
                 HookRepr::Empty => (),
             }
@@ -102,7 +107,6 @@ pub struct EmulatorModules<ET, S>
 where
     S: UsesInput,
 {
-    qemu: Qemu,
     modules: Pin<Box<ET>>,
     hooks: EmulatorHooks<ET, S>,
     phantom: PhantomData<S>,
@@ -128,13 +132,13 @@ where
 
     new_thread_hooks: Vec<Pin<Box<(NewThreadHookId, FatPtr)>>>,
 
-    #[cfg(emulation_mode = "usermode")]
+    #[cfg(feature = "usermode")]
     pre_syscall_hooks: Vec<Pin<Box<(PreSyscallHookId, FatPtr)>>>,
 
-    #[cfg(emulation_mode = "usermode")]
+    #[cfg(feature = "usermode")]
     post_syscall_hooks: Vec<Pin<Box<(PostSyscallHookId, FatPtr)>>>,
 
-    #[cfg(emulation_mode = "usermode")]
+    #[cfg(feature = "usermode")]
     crash_hooks: Vec<HookRepr>,
 
     phantom: PhantomData<(ET, S)>,
@@ -161,15 +165,20 @@ where
 
             new_thread_hooks: Vec::new(),
 
-            #[cfg(emulation_mode = "usermode")]
+            #[cfg(feature = "usermode")]
             pre_syscall_hooks: Vec::new(),
 
-            #[cfg(emulation_mode = "usermode")]
+            #[cfg(feature = "usermode")]
             post_syscall_hooks: Vec::new(),
 
-            #[cfg(emulation_mode = "usermode")]
+            #[cfg(feature = "usermode")]
             crash_hooks: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn qemu_hooks(&self) -> QemuHooks {
+        self.qemu_hooks
     }
 
     pub fn instruction_closure(
@@ -184,13 +193,13 @@ where
             .push(Box::pin((InstructionHookId::invalid(), fat)));
 
         unsafe {
-            let hook_state = &mut self
+            let hook_state = &raw mut self
                 .instruction_hooks
                 .last_mut()
                 .unwrap()
                 .as_mut()
                 .get_unchecked_mut()
-                .1 as *mut FatPtr;
+                .1;
 
             let id = self.qemu_hooks.add_instruction_hooks(
                 &mut *hook_state,
@@ -400,7 +409,7 @@ where
         }
     }
 
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::similar_names)]
     pub fn reads(
         &mut self,
         generation_hook: ReadGenHook<ET, S>,
@@ -488,7 +497,7 @@ where
         }
     }
 
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::similar_names)]
     pub fn writes(
         &mut self,
         generation_hook: WriteGenHook<ET, S>,
@@ -650,19 +659,21 @@ where
         }
     }
 
-    pub fn backdoor_closure(&mut self, hook: BackdoorHookClosure<ET, S>) -> BackdoorHookId {
+    /// # Safety
+    /// Will dereference the hook as [`FatPtr`].
+    pub unsafe fn backdoor_closure(&mut self, hook: BackdoorHookClosure<ET, S>) -> BackdoorHookId {
         unsafe {
             let fat: FatPtr = transmute(hook);
             self.backdoor_hooks
                 .push(Box::pin((BackdoorHookId::invalid(), fat)));
 
-            let hook_state = &mut self
+            let hook_state = &raw mut self
                 .backdoor_hooks
                 .last_mut()
                 .unwrap()
                 .as_mut()
                 .get_unchecked_mut()
-                .1 as *mut FatPtr;
+                .1;
 
             let id = self
                 .qemu_hooks
@@ -679,17 +690,16 @@ where
         }
     }
 
-    pub fn backdoor_function(
-        &self,
-        hook: fn(&mut EmulatorModules<ET, S>, Option<&mut S>, cpu: CPUArchStatePtr, pc: GuestAddr),
-    ) -> BackdoorHookId {
+    pub fn backdoor_function(&self, hook: BackdoorHookFn<ET, S>) -> BackdoorHookId {
         unsafe {
             self.qemu_hooks
                 .add_backdoor_hook(transmute(hook), func_backdoor_hook_wrapper::<ET, S>)
         }
     }
 
-    pub fn backdoor(&mut self, hook: BackdoorHook<ET, S>) -> Option<BackdoorHookId> {
+    /// # Safety
+    /// This can call through to a potentialy unsafe `backtoor_function`
+    pub unsafe fn backdoor(&mut self, hook: BackdoorHook<ET, S>) -> Option<BackdoorHookId> {
         match hook {
             Hook::Function(f) => Some(self.backdoor_function(f)),
             Hook::Closure(c) => Some(self.backdoor_closure(c)),
@@ -713,15 +723,7 @@ where
         }
     }
 
-    pub fn thread_creation_function(
-        &mut self,
-        hook: fn(
-            &mut EmulatorModules<ET, S>,
-            Option<&mut S>,
-            env: CPUArchStatePtr,
-            tid: u32,
-        ) -> bool,
-    ) -> NewThreadHookId {
+    pub fn thread_creation_function(&mut self, hook: NewThreadHookFn<ET, S>) -> NewThreadHookId {
         unsafe {
             self.qemu_hooks
                 .add_new_thread_hook(transmute(hook), func_new_thread_hook_wrapper::<ET, S>)
@@ -737,13 +739,13 @@ where
             self.new_thread_hooks
                 .push(Box::pin((NewThreadHookId::invalid(), fat)));
 
-            let hook_state = &mut self
+            let hook_state = &raw mut self
                 .new_thread_hooks
                 .last_mut()
                 .unwrap()
                 .as_mut()
                 .get_unchecked_mut()
-                .1 as *mut FatPtr;
+                .1;
 
             let id = self
                 .qemu_hooks
@@ -759,17 +761,16 @@ where
     }
 }
 
-#[cfg(emulation_mode = "usermode")]
+#[cfg(feature = "usermode")]
 impl<ET, S> EmulatorHooks<ET, S>
 where
     ET: EmulatorModuleTuple<S>,
     S: Unpin + UsesInput,
 {
-    #[allow(clippy::type_complexity)]
-    pub fn syscalls(&mut self, hook: PreSyscallHook<ET, S>) -> Option<PreSyscallHookId> {
+    pub fn pre_syscalls(&mut self, hook: PreSyscallHook<ET, S>) -> Option<PreSyscallHookId> {
         match hook {
-            Hook::Function(f) => Some(self.syscalls_function(f)),
-            Hook::Closure(c) => Some(self.syscalls_closure(c)),
+            Hook::Function(f) => Some(self.pre_syscalls_function(f)),
+            Hook::Closure(c) => Some(self.pre_syscalls_closure(c)),
             Hook::Raw(r) => {
                 let z: *const () = ptr::null::<()>();
                 Some(self.qemu_hooks.add_pre_syscall_hook(z, r))
@@ -778,29 +779,31 @@ where
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn syscalls_function(&mut self, hook: PreSyscallHookFn<ET, S>) -> PreSyscallHookId {
+    pub fn pre_syscalls_function(&mut self, hook: PreSyscallHookFn<ET, S>) -> PreSyscallHookId {
+        // # Safety
+        // Will dereference the hook as [`FatPtr`].
         unsafe {
             self.qemu_hooks
                 .add_pre_syscall_hook(transmute(hook), func_pre_syscall_hook_wrapper::<ET, S>)
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn syscalls_closure(&mut self, hook: PreSyscallHookClosure<ET, S>) -> PreSyscallHookId {
+    pub fn pre_syscalls_closure(&mut self, hook: PreSyscallHookClosure<ET, S>) -> PreSyscallHookId {
+        // # Safety
+        // Will dereference the hook as [`FatPtr`].
         unsafe {
             let fat: FatPtr = transmute(hook);
 
             self.pre_syscall_hooks
                 .push(Box::pin((PreSyscallHookId::invalid(), fat)));
 
-            let hook_state = &mut self
+            let hook_state = &raw mut self
                 .pre_syscall_hooks
                 .last_mut()
                 .unwrap()
                 .as_mut()
                 .get_unchecked_mut()
-                .1 as *mut FatPtr;
+                .1;
 
             let id = self
                 .qemu_hooks
@@ -815,11 +818,10 @@ where
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn after_syscalls(&mut self, hook: PostSyscallHook<ET, S>) -> Option<PostSyscallHookId> {
+    pub fn post_syscalls(&mut self, hook: PostSyscallHook<ET, S>) -> Option<PostSyscallHookId> {
         match hook {
-            Hook::Function(f) => Some(self.after_syscalls_function(f)),
-            Hook::Closure(c) => Some(self.after_syscalls_closure(c)),
+            Hook::Function(f) => Some(self.post_syscalls_function(f)),
+            Hook::Closure(c) => Some(self.post_syscalls_closure(c)),
             Hook::Raw(r) => {
                 let z: *const () = ptr::null::<()>();
                 Some(self.qemu_hooks.add_post_syscall_hook(z, r))
@@ -828,16 +830,16 @@ where
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn after_syscalls_function(&mut self, hook: PostSyscallHookFn<ET, S>) -> PostSyscallHookId {
+    pub fn post_syscalls_function(&mut self, hook: PostSyscallHookFn<ET, S>) -> PostSyscallHookId {
+        // # Safety
+        // Will dereference the hook as [`FatPtr`]. This should be ok.
         unsafe {
             self.qemu_hooks
                 .add_post_syscall_hook(transmute(hook), func_post_syscall_hook_wrapper::<ET, S>)
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn after_syscalls_closure(
+    pub fn post_syscalls_closure(
         &mut self,
         hook: PostSyscallHookClosure<ET, S>,
     ) -> PostSyscallHookId {
@@ -846,13 +848,13 @@ where
             self.post_syscall_hooks
                 .push(Box::pin((PostSyscallHookId::invalid(), fat)));
 
-            let hooks_state = &mut self
+            let hooks_state = &raw mut self
                 .post_syscall_hooks
                 .last_mut()
                 .unwrap()
                 .as_mut()
                 .get_unchecked_mut()
-                .1 as *mut FatPtr;
+                .1;
 
             let id = self.qemu_hooks.add_post_syscall_hook(
                 &mut *hooks_state,
@@ -868,13 +870,17 @@ where
         }
     }
 
-    pub fn crash_function(&mut self, hook: fn(&mut EmulatorModules<ET, S>, target_signal: i32)) {
+    pub fn crash_function(&mut self, hook: CrashHookFn<ET, S>) {
+        // # Safety
+        // Will cast the valid hook to a ptr.
         self.qemu_hooks.set_crash_hook(crash_hook_wrapper::<ET, S>);
         self.crash_hooks
             .push(HookRepr::Function(hook as *const libc::c_void));
     }
 
     pub fn crash_closure(&mut self, hook: CrashHookClosure<ET, S>) {
+        // # Safety
+        // Will cast the hook to a [`FatPtr`].
         unsafe {
             self.qemu_hooks.set_crash_hook(crash_hook_wrapper::<ET, S>);
             self.crash_hooks.push(HookRepr::Closure(transmute(hook)));
@@ -907,14 +913,14 @@ where
     pub unsafe fn emulator_modules_mut_unchecked<'a>() -> &'a mut EmulatorModules<ET, S> {
         #[cfg(debug_assertions)]
         {
-            (EMULATOR_TOOLS as *mut EmulatorModules<ET, S>)
+            (EMULATOR_MODULES as *mut EmulatorModules<ET, S>)
                 .as_mut()
                 .unwrap()
         }
 
         #[cfg(not(debug_assertions))]
         {
-            &mut *(EMULATOR_TOOLS as *mut EmulatorModules<ET, S>)
+            &mut *(EMULATOR_MODULES as *mut EmulatorModules<ET, S>)
         }
     }
 
@@ -928,7 +934,7 @@ where
     /// generic use (it will suppose they are the same as the ones used at initialization time).
     #[must_use]
     pub unsafe fn emulator_modules_mut<'a>() -> Option<&'a mut EmulatorModules<ET, S>> {
-        unsafe { (EMULATOR_TOOLS as *mut EmulatorModules<ET, S>).as_mut() }
+        unsafe { (EMULATOR_MODULES as *mut EmulatorModules<ET, S>).as_mut() }
     }
 }
 
@@ -953,7 +959,7 @@ where
     pub fn instruction_function(
         &mut self,
         addr: GuestAddr,
-        hook: fn(&mut EmulatorModules<ET, S>, Option<&mut S>, GuestAddr),
+        hook: InstructionHookFn<ET, S>,
         invalidate_block: bool,
     ) -> InstructionHookId {
         self.hooks
@@ -987,7 +993,6 @@ where
             .blocks(generation_hook, post_generation_hook, execution_hook)
     }
 
-    #[allow(clippy::similar_names)]
     pub fn reads(
         &mut self,
         generation_hook: ReadGenHook<ET, S>,
@@ -1007,7 +1012,6 @@ where
         )
     }
 
-    #[allow(clippy::similar_names)]
     pub fn writes(
         &mut self,
         generation_hook: WriteGenHook<ET, S>,
@@ -1044,7 +1048,9 @@ where
         )
     }
 
-    pub fn backdoor(&mut self, hook: BackdoorHook<ET, S>) -> Option<BackdoorHookId> {
+    /// # Safety
+    /// This will potentially call an unsafe backdoor hook
+    pub unsafe fn backdoor(&mut self, hook: BackdoorHook<ET, S>) -> Option<BackdoorHookId> {
         self.hooks.backdoor(hook)
     }
 
@@ -1052,7 +1058,9 @@ where
         self.hooks.backdoor_function(hook)
     }
 
-    pub fn backdoor_closure(&mut self, hook: BackdoorHookClosure<ET, S>) -> BackdoorHookId {
+    /// # Safety
+    /// Calls through to the potentially unsafe `backdoor_closure`
+    pub unsafe fn backdoor_closure(&mut self, hook: BackdoorHookClosure<ET, S>) -> BackdoorHookId {
         self.hooks.backdoor_closure(hook)
     }
 
@@ -1060,15 +1068,7 @@ where
         self.hooks.thread_creation(hook)
     }
 
-    pub fn thread_creation_function(
-        &mut self,
-        hook: fn(
-            &mut EmulatorModules<ET, S>,
-            Option<&mut S>,
-            env: CPUArchStatePtr,
-            tid: u32,
-        ) -> bool,
-    ) -> NewThreadHookId {
+    pub fn thread_creation_function(&mut self, hook: NewThreadHookFn<ET, S>) -> NewThreadHookId {
         self.hooks.thread_creation_function(hook)
     }
 
@@ -1085,11 +1085,10 @@ where
     ET: EmulatorModuleTuple<S>,
     S: UsesInput + Unpin,
 {
-    pub(super) fn new(qemu: Qemu, modules: ET) -> Pin<Box<Self>> {
+    pub(super) fn new(emulator_hooks: EmulatorHooks<ET, S>, modules: ET) -> Pin<Box<Self>> {
         let mut modules = Box::pin(Self {
-            qemu,
             modules: Box::pin(modules),
-            hooks: EmulatorHooks::default(),
+            hooks: emulator_hooks,
             phantom: PhantomData,
         });
 
@@ -1100,49 +1099,62 @@ where
 
         // Set global EmulatorModules pointer
         unsafe {
-            if EMULATOR_TOOLS.is_null() {
-                EMULATOR_TOOLS = ptr::from_mut::<Self>(modules.as_mut().get_mut()) as *mut ();
+            if EMULATOR_MODULES.is_null() {
+                EMULATOR_MODULES = ptr::from_mut::<Self>(modules.as_mut().get_mut()) as *mut ();
             } else {
                 panic!("Emulator Modules have already been set and is still active. It is not supported to have multiple instances of `EmulatorModules` at the same time yet.")
             }
         }
 
-        unsafe {
-            // We give access to EmulatorModuleTuple<S> during init, the compiler complains (for good reasons)
-            // TODO: We should find a way to be able to check for a module without giving full access to the tuple.
-            modules
-                .modules
-                .init_modules_all(Self::emulator_modules_mut_unchecked());
-        }
-
         modules
     }
 
-    pub fn first_exec_all(&mut self) {
+    pub fn post_qemu_init_all(&mut self, qemu: Qemu) {
+        // We give access to EmulatorModuleTuple<S> during init, the compiler complains (for good reasons)
+        // TODO: We should find a way to be able to check for a module without giving full access to the tuple.
         unsafe {
             self.modules_mut()
-                .first_exec_all(Self::emulator_modules_mut_unchecked());
+                .post_qemu_init_all(qemu, Self::emulator_modules_mut_unchecked());
         }
     }
 
-    pub fn pre_exec_all(&mut self, input: &S::Input) {
+    pub fn first_exec_all(&mut self, qemu: Qemu, state: &mut S) {
+        // # Safety
+        // We assume that the emulator was initialized correctly
         unsafe {
             self.modules_mut()
-                .pre_exec_all(Self::emulator_modules_mut_unchecked(), input);
+                .first_exec_all(qemu, Self::emulator_modules_mut_unchecked(), state);
+        }
+    }
+
+    pub fn pre_exec_all(&mut self, qemu: Qemu, state: &mut S, input: &S::Input) {
+        // # Safety
+        // We assume that the emulator was initialized correctly
+        unsafe {
+            self.modules_mut().pre_exec_all(
+                qemu,
+                Self::emulator_modules_mut_unchecked(),
+                state,
+                input,
+            );
         }
     }
 
     pub fn post_exec_all<OT>(
         &mut self,
+        qemu: Qemu,
+        state: &mut S,
         input: &S::Input,
         observers: &mut OT,
         exit_kind: &mut ExitKind,
     ) where
-        OT: ObserversTuple<S>,
+        OT: ObserversTuple<S::Input, S>,
     {
         unsafe {
             self.modules_mut().post_exec_all(
+                qemu,
                 Self::emulator_modules_mut_unchecked(),
+                state,
                 input,
                 observers,
                 exit_kind,
@@ -1173,13 +1185,12 @@ where
     S: UsesInput,
 {
     #[must_use]
-    pub fn qemu(&self) -> Qemu {
-        self.qemu
-    }
-
-    #[must_use]
     pub fn modules(&self) -> &ET {
         self.modules.as_ref().get_ref()
+    }
+
+    pub fn hooks(&mut self) -> &EmulatorHooks<ET, S> {
+        &self.hooks
     }
 
     pub fn hooks_mut(&mut self) -> &mut EmulatorHooks<ET, S> {
@@ -1188,113 +1199,65 @@ where
 }
 
 /// Usermode-only high-level functions
-#[cfg(emulation_mode = "usermode")]
+#[cfg(feature = "usermode")]
 impl<ET, S> EmulatorModules<ET, S>
 where
     ET: EmulatorModuleTuple<S>,
     S: Unpin + UsesInput,
 {
-    #[allow(clippy::type_complexity)]
-    pub fn syscalls(&mut self, hook: PreSyscallHook<ET, S>) -> Option<PreSyscallHookId> {
-        self.hooks.syscalls(hook)
+    pub fn pre_syscalls(&mut self, hook: PreSyscallHook<ET, S>) -> Option<PreSyscallHookId> {
+        self.hooks.pre_syscalls(hook)
     }
 
+    /// # Safety
+    /// Calls through to the, potentially unsafe, `syscalls_function`
     #[allow(clippy::type_complexity)]
-    pub fn syscalls_function(
+    pub unsafe fn pre_syscalls_function(
         &mut self,
-        hook: fn(
-            &mut EmulatorModules<ET, S>,
-            Option<&mut S>,
-            sys_num: i32,
-            a0: GuestAddr,
-            a1: GuestAddr,
-            a2: GuestAddr,
-            a3: GuestAddr,
-            a4: GuestAddr,
-            a5: GuestAddr,
-            a6: GuestAddr,
-            a7: GuestAddr,
-        ) -> SyscallHookResult,
+        hook: PreSyscallHookFn<ET, S>,
     ) -> PreSyscallHookId {
-        self.hooks.syscalls_function(hook)
+        self.hooks.pre_syscalls_function(hook)
     }
 
+    /// # Safety
+    /// Calls through to the, potentially unsafe, `syscalls_closure`
     #[allow(clippy::type_complexity)]
-    pub fn syscalls_closure(
+    pub unsafe fn pre_syscalls_closure(
         &mut self,
-        hook: Box<
-            dyn for<'a> FnMut(
-                &'a mut EmulatorModules<ET, S>,
-                Option<&'a mut S>,
-                i32,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-            ) -> SyscallHookResult,
-        >,
+        hook: PreSyscallHookClosure<ET, S>,
     ) -> PreSyscallHookId {
-        self.hooks.syscalls_closure(hook)
+        self.hooks.pre_syscalls_closure(hook)
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn after_syscalls(&mut self, hook: PostSyscallHook<ET, S>) -> Option<PostSyscallHookId> {
-        self.hooks.after_syscalls(hook)
+    pub fn post_syscalls(&mut self, hook: PostSyscallHook<ET, S>) -> Option<PostSyscallHookId> {
+        self.hooks.post_syscalls(hook)
     }
 
+    /// # Safety
+    /// Calls through to the, potentially unsafe, `after_syscalls_function`
     #[allow(clippy::type_complexity)]
-    pub fn after_syscalls_function(
+    pub unsafe fn post_syscalls_function(
         &mut self,
-        hook: fn(
-            &mut EmulatorModules<ET, S>,
-            Option<&mut S>,
-            res: GuestAddr,
-            sys_num: i32,
-            a0: GuestAddr,
-            a1: GuestAddr,
-            a2: GuestAddr,
-            a3: GuestAddr,
-            a4: GuestAddr,
-            a5: GuestAddr,
-            a6: GuestAddr,
-            a7: GuestAddr,
-        ) -> GuestAddr,
+        hook: PostSyscallHookFn<ET, S>,
     ) -> PostSyscallHookId {
-        self.hooks.after_syscalls_function(hook)
+        self.hooks.post_syscalls_function(hook)
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn after_syscalls_closure(
+    pub fn post_syscalls_closure(
         &mut self,
-        hook: Box<
-            dyn for<'a> FnMut(
-                &'a mut EmulatorModules<ET, S>,
-                Option<&mut S>,
-                GuestAddr,
-                i32,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-                GuestAddr,
-            ) -> GuestAddr,
-        >,
+        hook: PostSyscallHookClosure<ET, S>,
     ) -> PostSyscallHookId {
-        self.hooks.after_syscalls_closure(hook)
+        self.hooks.post_syscalls_closure(hook)
     }
 
-    pub fn crash_function(&mut self, hook: fn(&mut EmulatorModules<ET, S>, target_signal: i32)) {
+    pub fn crash_function(&mut self, hook: CrashHookFn<ET, S>) {
         self.hooks.crash_function(hook);
     }
 
-    pub fn crash_closure(&mut self, hook: CrashHookClosure<ET, S>) {
+    /// # Safety
+    /// Calls through to the, potentially unsafe, registered `crash_closure`
+    pub unsafe fn crash_closure(&mut self, hook: CrashHookClosure<ET, S>) {
         self.hooks.crash_closure(hook);
     }
 }
@@ -1306,7 +1269,7 @@ where
     fn drop(&mut self) {
         // Make the global pointer null at drop time
         unsafe {
-            EMULATOR_TOOLS = ptr::null_mut();
+            EMULATOR_MODULES = ptr::null_mut();
         }
     }
 }

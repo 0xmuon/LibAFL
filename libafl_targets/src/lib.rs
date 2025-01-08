@@ -1,24 +1,7 @@
 //! `libafl_targets` contains runtime code, injected in the target itself during compilation.
 #![no_std]
-#![deny(rustdoc::broken_intra_doc_links)]
-#![deny(clippy::all)]
-#![deny(clippy::pedantic)]
-#![forbid(unexpected_cfgs)]
 // For `std::simd`
 #![cfg_attr(nightly, feature(portable_simd))]
-#![allow(
-    clippy::unreadable_literal,
-    clippy::type_repetition_in_bounds,
-    clippy::missing_errors_doc,
-    clippy::cast_possible_truncation,
-    clippy::used_underscore_binding,
-    clippy::ptr_as_ptr,
-    clippy::missing_panics_doc,
-    clippy::missing_docs_in_private_items,
-    clippy::module_name_repetitions,
-    clippy::pub_underscore_fields,
-    clippy::into_iter_without_iter, // broken
-)]
 #![cfg_attr(not(test), warn(
     missing_debug_implementations,
     missing_docs,
@@ -62,7 +45,8 @@
 #[cfg(feature = "std")]
 #[macro_use]
 extern crate std;
-#[allow(unused_imports)]
+
+#[allow(unused_imports)] // for no-std
 #[macro_use]
 extern crate alloc;
 
@@ -72,6 +56,7 @@ include!(concat!(env!("OUT_DIR"), "/constants.rs"));
     feature = "sancov_pcguard_edges",
     feature = "sancov_pcguard_hitcounts",
     feature = "sancov_ngram4",
+    feature = "sancov_ngram8",
     feature = "sancov_ctx"
 ))]
 pub mod sancov_pcguard;
@@ -79,6 +64,7 @@ pub mod sancov_pcguard;
     feature = "sancov_pcguard_edges",
     feature = "sancov_pcguard_hitcounts",
     feature = "sancov_ngram4",
+    feature = "sancov_ngram8",
     feature = "sancov_ctx"
 ))]
 pub use sancov_pcguard::*;
@@ -90,7 +76,6 @@ pub use sancov_cmp::*;
 
 /// Module containing bindings to the various sanitizer interface headers
 #[cfg(feature = "sanitizer_interfaces")]
-#[allow(clippy::mixed_attributes_style)]
 pub mod sanitizer_ifaces {
     #![allow(non_snake_case)]
     #![allow(non_camel_case_types)]
@@ -101,6 +86,8 @@ pub mod sanitizer_ifaces {
     #![allow(missing_docs)]
     #![allow(missing_debug_implementations)]
     #![allow(unused_qualifications)]
+    #![allow(clippy::pub_underscore_fields)]
+
     include!(concat!(env!("OUT_DIR"), "/sanitizer_interfaces.rs"));
 }
 

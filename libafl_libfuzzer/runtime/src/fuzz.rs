@@ -19,7 +19,7 @@ use libafl::{
     executors::ExitKind,
     inputs::UsesInput,
     monitors::{tui::TuiMonitor, Monitor, MultiMonitor},
-    stages::{HasCurrentStage, StagesTuple},
+    stages::{HasCurrentStageId, StagesTuple},
     state::{HasExecutions, HasLastReportTime, HasSolutions, Stoppable, UsesState},
     Error, Fuzzer, HasMetadata,
 };
@@ -62,13 +62,13 @@ fn do_fuzz<F, ST, E, S, EM>(
     mgr: &mut EM,
 ) -> Result<(), Error>
 where
-    F: Fuzzer<E, EM, ST, State = S>,
+    F: Fuzzer<E, EM, S, ST>,
     S: HasMetadata
         + HasExecutions
         + UsesInput
         + HasSolutions
         + HasLastReportTime
-        + HasCurrentStage
+        + HasCurrentStageId
         + Stoppable,
     E: UsesState<State = S>,
     EM: ProgressReporter<State = S> + EventProcessor<E, F>,

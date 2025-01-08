@@ -17,13 +17,13 @@ use libafl::{
     fuzzer::{Fuzzer, StdFuzzer},
     generators::RandPrintablesGenerator,
     inputs::{BytesInput, HasTargetBytes},
-    mutators::scheduled::{havoc_mutations, StdScheduledMutator},
+    mutators::{havoc_mutations::havoc_mutations, scheduled::StdScheduledMutator},
     observers::StdMapObserver,
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
     state::{HasSolutions, StdState},
 };
-use libafl_bolts::{rands::StdRand, tuples::tuple_list, AsSlice};
+use libafl_bolts::{nonzero, rands::StdRand, tuples::tuple_list, AsSlice};
 use libafl_targets::{edges_max_num, DifferentialAFLMapSwapObserver};
 #[cfg(not(miri))]
 use mimalloc::MiMalloc;
@@ -61,8 +61,7 @@ mod slicemap {
 #[cfg(not(feature = "multimap"))]
 use slicemap::{HitcountsMapObserver, EDGES};
 
-#[allow(clippy::similar_names)]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub fn main() {
     // The closure that we want to fuzz
     let mut first_harness = |input: &BytesInput| {
@@ -144,6 +143,8 @@ pub fn main() {
             EDGES = core::slice::from_raw_parts_mut(alloc_zeroed(layout), num_edges * 2);
         }
 
+        // TODO: This will break soon, fix me! See https://github.com/AFLplusplus/LibAFL/issues/2786
+        #[allow(static_mut_refs)] // only a problem on nightly
         let edges_ptr = unsafe { EDGES.as_mut_ptr() };
 
         // create the base maps used to observe the different executors by splitting a slice
@@ -247,7 +248,7 @@ pub fn main() {
     );
 
     // Generator of printable bytearrays of max size 32
-    let mut generator = RandPrintablesGenerator::new(32);
+    let mut generator = RandPrintablesGenerator::new(nonzero!(32));
 
     // Generate 8 initial inputs
     state

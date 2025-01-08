@@ -2,13 +2,14 @@
 #[cfg(unix)]
 pub mod unix_signal_handler {
     use alloc::{boxed::Box, string::String, vec::Vec};
-    use core::{mem::transmute, ptr::addr_of_mut};
+    use core::mem::transmute;
     use std::{io::Write, panic};
 
-    use libafl_bolts::os::unix_signals::{ucontext_t, Handler, Signal};
+    use libafl_bolts::os::unix_signals::{ucontext_t, Signal, SignalHandler};
     use libc::siginfo_t;
 
     use crate::{
+        corpus::Corpus,
         events::{EventFirer, EventRestarter},
         executors::{
             common_signals,
@@ -19,7 +20,8 @@ pub mod unix_signal_handler {
         feedbacks::Feedback,
         fuzzer::HasObjective,
         inputs::{Input, UsesInput},
-        state::{HasCorpus, HasExecutions, HasSolutions},
+        observers::ObserversTuple,
+        state::{HasCorpus, HasExecutions, HasSolutions, UsesState},
     };
 
     pub(crate) type HandlerFuncPtr = unsafe fn(
@@ -29,7 +31,7 @@ pub mod unix_signal_handler {
         data: *mut InProcessExecutorHandlerData,
     );
 
-    /// A handler that does nothing.
+    // A handler that does nothing.
     /*pub fn nop_handler(
         _signal: Signal,
         _info: &mut siginfo_t,
@@ -39,15 +41,17 @@ pub mod unix_signal_handler {
     }*/
 
     #[cfg(unix)]
-    impl Handler for InProcessExecutorHandlerData {
-        fn handle(
+    impl SignalHandler for InProcessExecutorHandlerData {
+        /// # Safety
+        /// This will access global state.
+        unsafe fn handle(
             &mut self,
             signal: Signal,
             info: &mut siginfo_t,
             context: Option<&mut ucontext_t>,
         ) {
             unsafe {
-                let data = addr_of_mut!(GLOBAL_STATE);
+                let data = &raw mut GLOBAL_STATE;
                 let in_handler = (*data).set_in_handler(true);
                 match signal {
                     Signal::SigUser2 | Signal::SigAlarm => {
@@ -75,16 +79,19 @@ pub mod unix_signal_handler {
     /// invokes the `post_exec` hook on all observer in case of panic
     pub fn setup_panic_hook<E, EM, OF, Z>()
     where
-        E: HasObservers,
+        E: Executor<EM, Z> + HasObservers,
+        E::Observers: ObserversTuple<<E::State as UsesInput>::Input, E::State>,
         EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-        OF: Feedback<E::State>,
+        OF: Feedback<EM, E::Input, E::Observers, E::State>,
         E::State: HasExecutions + HasSolutions + HasCorpus,
-        Z: HasObjective<Objective = OF, State = E::State>,
+        Z: HasObjective<Objective = OF>,
+        <<E as UsesState>::State as HasSolutions>::Solutions: Corpus<Input = E::Input>, //delete me
+        <<<E as UsesState>::State as HasCorpus>::Corpus as Corpus>::Input: Clone,       //delete me
     {
         let old_hook = panic::take_hook();
         panic::set_hook(Box::new(move |panic_info| unsafe {
             old_hook(panic_info);
-            let data = addr_of_mut!(GLOBAL_STATE);
+            let data = &raw mut GLOBAL_STATE;
             let in_handler = (*data).set_in_handler(true);
             if (*data).is_valid() {
                 // We are fuzzing!
@@ -115,18 +122,21 @@ pub mod unix_signal_handler {
     /// # Safety
     /// Well, signal handling is not safe
     #[cfg(unix)]
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value)] // nightly no longer requires this
     pub unsafe fn inproc_timeout_handler<E, EM, OF, Z>(
         _signal: Signal,
         _info: &mut siginfo_t,
         _context: Option<&mut ucontext_t>,
         data: &mut InProcessExecutorHandlerData,
     ) where
-        E: HasObservers + HasInProcessHooks<E::State>,
+        E: Executor<EM, Z> + HasInProcessHooks<E::State> + HasObservers,
+        E::Observers: ObserversTuple<<E::State as UsesInput>::Input, E::State>,
         EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-        OF: Feedback<E::State>,
+        OF: Feedback<EM, E::Input, E::Observers, E::State>,
         E::State: HasExecutions + HasSolutions + HasCorpus,
-        Z: HasObjective<Objective = OF, State = E::State>,
+        Z: HasObjective<Objective = OF>,
+        <<E as UsesState>::State as HasSolutions>::Solutions: Corpus<Input = E::Input>, //delete me
+        <<<E as UsesState>::State as HasCorpus>::Corpus as Corpus>::Input: Clone,       //delete me
     {
         // this stuff is for batch timeout
         if !data.executor_ptr.is_null()
@@ -169,8 +179,7 @@ pub mod unix_signal_handler {
     ///
     /// # Safety
     /// Well, signal handling is not safe
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value)] // nightly no longer requires this
     pub unsafe fn inproc_crash_handler<E, EM, OF, Z>(
         signal: Signal,
         _info: &mut siginfo_t,
@@ -178,10 +187,13 @@ pub mod unix_signal_handler {
         data: &mut InProcessExecutorHandlerData,
     ) where
         E: Executor<EM, Z> + HasObservers,
+        E::Observers: ObserversTuple<<E::State as UsesInput>::Input, E::State>,
         EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-        OF: Feedback<E::State>,
+        OF: Feedback<EM, E::Input, E::Observers, E::State>,
         E::State: HasExecutions + HasSolutions + HasCorpus,
-        Z: HasObjective<Objective = OF, State = E::State>,
+        Z: HasObjective<Objective = OF>,
+        <<E as UsesState>::State as HasSolutions>::Solutions: Corpus<Input = E::Input>, //delete me
+        <<<E as UsesState>::State as HasCorpus>::Corpus as Corpus>::Input: Clone,       //delete me
     {
         #[cfg(all(target_os = "android", target_arch = "aarch64"))]
         let _context = _context.map(|p| {

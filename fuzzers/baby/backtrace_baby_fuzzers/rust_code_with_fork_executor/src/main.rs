@@ -12,21 +12,21 @@ use libafl::{
     generators::RandPrintablesGenerator,
     inputs::{BytesInput, HasTargetBytes},
     monitors::SimpleMonitor,
-    mutators::scheduled::{havoc_mutations, StdScheduledMutator},
+    mutators::{havoc_mutations::havoc_mutations, scheduled::StdScheduledMutator},
     observers::{BacktraceObserver, StdMapObserver},
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
     state::StdState,
 };
 use libafl_bolts::{
+    nonzero,
     ownedref::OwnedRefMut,
     rands::StdRand,
-    shmem::{unix_shmem, ShMem, ShMemProvider},
+    shmem::{unix_shmem, ShMemProvider},
     tuples::tuple_list,
     AsSlice, AsSliceMut,
 };
 
-#[allow(clippy::similar_names)]
 pub fn main() {
     let mut shmem_provider = unix_shmem::UnixShMemProvider::new().unwrap();
     let mut signals = shmem_provider.new_shmem(16).unwrap();
@@ -65,6 +65,7 @@ pub fn main() {
     };
 
     // Create an observation channel using the signals map
+
     let observer = unsafe { StdMapObserver::from_mut_ptr("signals", signals_ptr, signals_len) };
     // Create a stacktrace observer
     let bt_observer = BacktraceObserver::new(
@@ -122,7 +123,7 @@ pub fn main() {
     .expect("Failed to create the Executor");
 
     // Generator of printable bytearrays of max size 32
-    let mut generator = RandPrintablesGenerator::new(32);
+    let mut generator = RandPrintablesGenerator::new(nonzero!(32));
 
     // Generate 8 initial inputs
     state

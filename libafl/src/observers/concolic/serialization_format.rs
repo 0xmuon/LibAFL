@@ -109,7 +109,7 @@ impl<R: Read> MessageFileReader<R> {
 
     /// This transforms the given message from it's serialized form into its in-memory form, making relative references
     /// absolute and counting the `SymExprRef`s.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn transform_message(&mut self, message: &mut SymExpr) -> SymExprRef {
         let ret = self.current_id;
         match message {
@@ -242,7 +242,7 @@ impl<W: Write + Seek> MessageFileWriter<W> {
     /// Create a `MessageFileWriter` from the given [`Write`].
     pub fn from_writer(mut writer: W) -> io::Result<Self> {
         let writer_start_position = writer.stream_position()?;
-        // write dummy trace length
+        // write preliminary trace length
         writer.write_all(&0_u64.to_le_bytes())?;
         Ok(Self {
             id_counter: 1,
@@ -283,7 +283,7 @@ impl<W: Write + Seek> MessageFileWriter<W> {
 
     /// Writes a message to the stream and returns the [`SymExprRef`] that should be used to refer back to this message.
     /// May error when the underlying `Write` errors or when there is a serialization error.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn write_message(&mut self, mut message: SymExpr) -> Result<SymExprRef> {
         let current_id = self.id_counter;
         match &mut message {

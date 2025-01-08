@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, ptr::NonNull, time::Duration};
 
 use libafl::{
     corpus::{InMemoryCorpus, OnDiskCorpus},
@@ -10,13 +10,14 @@ use libafl::{
     generators::RandPrintablesGenerator,
     inputs::{BytesInput, HasTargetBytes},
     monitors::SimpleMonitor,
-    mutators::scheduled::{havoc_mutations, StdScheduledMutator},
+    mutators::{havoc_mutations::havoc_mutations, scheduled::StdScheduledMutator},
     observers::{BacktraceObserver, ConstMapObserver},
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
     state::StdState,
 };
 use libafl_bolts::{
+    nonzero,
     ownedref::OwnedRefMut,
     rands::StdRand,
     shmem::{ShMemProvider, StdShMemProvider},
@@ -33,7 +34,6 @@ extern "C" {
 
 }
 
-#[allow(clippy::similar_names)]
 pub fn main() {
     let mut shmem_provider = StdShMemProvider::new().unwrap();
     unsafe { create_shmem_array() };
@@ -45,7 +45,14 @@ pub fn main() {
         libafl::executors::ExitKind::Ok
     };
     // Create an observation channel using the signals map
-    let observer = unsafe { ConstMapObserver::<u8, 3>::from_mut_ptr("signals", map_ptr) };
+    let observer = unsafe {
+        ConstMapObserver::from_mut_ptr(
+            "signals",
+            NonNull::new(map_ptr)
+                .expect("map ptr is null.")
+                .cast::<[u8; 3]>(),
+        )
+    };
     // Create a stacktrace observer
     let mut bt = shmem_provider.new_on_shmem::<Option<u64>>(None).unwrap();
     let bt_observer = BacktraceObserver::new(
@@ -103,7 +110,7 @@ pub fn main() {
     .expect("Failed to create the Executor");
 
     // Generator of printable bytearrays of max size 32
-    let mut generator = RandPrintablesGenerator::new(32);
+    let mut generator = RandPrintablesGenerator::new(nonzero!(32));
 
     // Generate 8 initial inputs
     state

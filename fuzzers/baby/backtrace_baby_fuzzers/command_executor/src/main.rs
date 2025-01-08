@@ -17,7 +17,7 @@ use libafl::{
     generators::RandPrintablesGenerator,
     inputs::{BytesInput, HasTargetBytes},
     monitors::SimpleMonitor,
-    mutators::scheduled::{havoc_mutations, StdScheduledMutator},
+    mutators::{havoc_mutations::havoc_mutations, scheduled::StdScheduledMutator},
     observers::{get_asan_runtime_flags, AsanBacktraceObserver, StdMapObserver},
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
@@ -25,13 +25,13 @@ use libafl::{
     Error,
 };
 use libafl_bolts::{
+    nonzero,
     rands::StdRand,
     shmem::{unix_shmem, ShMem, ShMemId, ShMemProvider},
     tuples::tuple_list,
     AsSlice, AsSliceMut,
 };
 
-#[allow(clippy::similar_names)]
 pub fn main() {
     let mut shmem_provider = unix_shmem::UnixShMemProvider::new().unwrap();
     let mut signals = shmem_provider.new_shmem(3).unwrap();
@@ -80,12 +80,16 @@ pub fn main() {
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
     // Create the executor for an in-process function with just one observer
+    #[expect(clippy::items_after_statements)]
     #[derive(Debug)]
     struct MyExecutor {
         shmem_id: ShMemId,
+        timeout: Duration,
     }
 
     impl CommandConfigurator<BytesInput> for MyExecutor {
+        #[allow(unknown_lints)] // stable doesn't even know of the lint
+        #[allow(clippy::zombie_processes)] // only a problem on nightly
         fn spawn_child(&mut self, input: &BytesInput) -> Result<Child, Error> {
             let mut command = Command::new("./test_command");
 
@@ -105,14 +109,19 @@ pub fn main() {
         }
 
         fn exec_timeout(&self) -> Duration {
-            Duration::from_secs(5)
+            self.timeout
+        }
+        fn exec_timeout_mut(&mut self) -> &mut Duration {
+            &mut self.timeout
         }
     }
 
-    let mut executor = MyExecutor { shmem_id }.into_executor(tuple_list!(observer, bt_observer));
+    let timeout = Duration::from_secs(5);
+    let mut executor =
+        MyExecutor { shmem_id, timeout }.into_executor(tuple_list!(observer, bt_observer));
 
     // Generator of printable bytearrays of max size 32
-    let mut generator = RandPrintablesGenerator::new(32);
+    let mut generator = RandPrintablesGenerator::new(nonzero!(32));
 
     // Generate 8 initial inputs
     state

@@ -6,14 +6,14 @@ use libafl::{
     feedbacks::MapFeedbackMetadata,
     inputs::UsesInput,
     monitors::SimpleMonitor,
-    stages::{HasCurrentStage, StagesTuple},
-    state::{HasExecutions, HasLastReportTime, Stoppable},
+    stages::{HasCurrentStageId, StagesTuple},
+    state::{HasExecutions, HasLastReportTime, Stoppable, UsesState},
     Error, Fuzzer, HasMetadata, HasNamedMetadata,
 };
 
 use crate::{fuzz_with, options::LibfuzzerOptions};
 
-#[allow(clippy::unnecessary_wraps, clippy::cast_precision_loss)]
+#[expect(clippy::unnecessary_wraps, clippy::cast_precision_loss)]
 fn do_report<F, ST, E, S, EM>(
     _options: &LibfuzzerOptions,
     _fuzzer: &mut F,
@@ -23,15 +23,15 @@ fn do_report<F, ST, E, S, EM>(
     _mgr: &mut EM,
 ) -> Result<(), Error>
 where
-    F: Fuzzer<E, EM, ST, State = S>,
+    F: Fuzzer<E, EM, S, ST>,
     S: HasMetadata
         + HasNamedMetadata
         + HasExecutions
         + UsesInput
         + HasLastReportTime
-        + HasCurrentStage
+        + HasCurrentStageId
         + Stoppable,
-    E: HasObservers<State = S>,
+    E: HasObservers + UsesState<State = S>,
     EM: ProgressReporter<State = S> + EventProcessor<E, F>,
     ST: StagesTuple<E, EM, S, F>,
 {

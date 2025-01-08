@@ -1,7 +1,10 @@
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
 use hashbrown::HashMap;
-use libafl_bolts::rands::{Rand, RomuDuoJrRand};
+use libafl_bolts::{
+    nonzero,
+    rands::{Rand, RomuDuoJrRand},
+};
 use pyo3::prelude::PyObject;
 
 use super::{
@@ -63,12 +66,12 @@ impl Context {
 
     #[must_use]
     pub fn get_nt(&self, r: &RuleIdOrCustom) -> NTermId {
-        return self.get_rule(r.id()).nonterm();
+        self.get_rule(r.id()).nonterm()
     }
 
     #[must_use]
     pub fn get_num_children(&self, r: &RuleIdOrCustom) -> usize {
-        return self.get_rule(r.id()).number_of_nonterms();
+        self.get_rule(r.id()).number_of_nonterms()
     }
 
     pub fn add_rule(&mut self, nt: &str, format: &[u8]) -> RuleId {
@@ -115,10 +118,10 @@ impl Context {
 
     #[must_use]
     pub fn nt_id(&self, nt: &str) -> NTermId {
-        return *self
+        *self
             .names_to_nt_id
             .get(nt)
-            .expect(&("no such nonterminal: ".to_owned() + nt));
+            .expect(&("no such nonterminal: ".to_owned() + nt))
     }
 
     #[must_use]
@@ -258,12 +261,13 @@ impl Context {
         max_len: usize,
         nt: NTermId,
         p_include_short_rules: usize,
-    ) -> impl Iterator<Item = &RuleId> + 'a {
+    ) -> impl Iterator<Item = &'a RuleId> + 'a {
         self.nts_to_rules[&nt]
             .iter()
             .take_while(move |r| self.rules_to_min_size[*r] <= max_len)
             .filter(move |r| {
-                self.rules_to_num_options[*r] > 1 || rand.below(100) <= p_include_short_rules
+                self.rules_to_num_options[*r] > 1
+                    || rand.below(nonzero!(100)) <= p_include_short_rules
             })
     }
 
@@ -353,6 +357,8 @@ mod tests {
         tree::{Tree, TreeLike},
     };
 
+    // Some (but not all) versions of clippy think the from_nt things are format strings.
+    #[allow(clippy::literal_string_with_formatting_args)]
     #[test]
     fn simple_context() {
         let mut ctx = Context::new();

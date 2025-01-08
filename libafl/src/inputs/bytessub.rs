@@ -96,7 +96,7 @@ where
     }
 }
 
-impl<'a, I> HasMutatorBytes for BytesSubInput<'a, I>
+impl<I> HasMutatorBytes for BytesSubInput<'_, I>
 where
     I: HasMutatorBytes,
 {
@@ -192,7 +192,7 @@ where
     }
 }
 
-impl<'a, I> HasLen for BytesSubInput<'a, I>
+impl<I> HasLen for BytesSubInput<'_, I>
 where
     I: HasMutatorBytes,
 {
@@ -201,16 +201,14 @@ where
         self.range.len()
     }
 }
-
 #[cfg(test)]
 mod tests {
-
     use alloc::vec::Vec;
 
     use libafl_bolts::HasLen;
 
     use crate::{
-        inputs::{BytesInput, HasMutatorBytes, MutVecInput, NopInput},
+        inputs::{BytesInput, HasMutatorBytes, NopInput},
         mutators::{havoc_mutations_no_crossover, MutatorsTuple},
         state::NopState,
     };
@@ -339,7 +337,6 @@ mod tests {
     #[test]
     fn test_bytessubinput_use_vec() {
         let mut test_vec = vec![0, 1, 2, 3, 4];
-        let mut test_vec = MutVecInput::from(&mut test_vec);
         let mut sub_vec = test_vec.sub_input(1..2);
         drop(sub_vec.drain(..));
         assert_eq!(test_vec.len(), 4);

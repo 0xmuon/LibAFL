@@ -11,6 +11,10 @@ pub use mutations::*;
 pub mod token_mutations;
 use serde::{Deserialize, Serialize};
 pub use token_mutations::*;
+pub mod havoc_mutations;
+pub use havoc_mutations::*;
+pub mod numeric;
+pub use numeric::{int_mutators, mapped_int_mutators};
 pub mod encoded_mutations;
 pub use encoded_mutations::*;
 pub mod mopt_mutator;
@@ -19,8 +23,15 @@ pub mod gramatron;
 pub use gramatron::*;
 pub mod grimoire;
 pub use grimoire::*;
+pub mod mapping;
+pub use mapping::*;
 pub mod tuneable;
 pub use tuneable::*;
+
+#[cfg(feature = "std")]
+pub mod hash;
+#[cfg(feature = "std")]
+pub use hash::*;
 
 #[cfg(feature = "unicode")]
 pub mod unicode;
@@ -71,19 +82,22 @@ impl From<u64> for MutationId {
 }
 
 impl From<i32> for MutationId {
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn from(value: i32) -> Self {
         debug_assert!(value >= 0);
         MutationId(value as usize)
     }
 }
 
-/// The result of a mutation.
-/// If the mutation got skipped, the target
-/// will not be executed with the returned input.
+/// Result of the mutation.
+///
+/// [`MutationResult::Skipped`] does not necessarily mean that the input changed,
+/// just that the mutator did something. For slow targets, consider using
+/// a filtered fuzzer (see [`crate::fuzzer::StdFuzzer::with_input_filter`])
+/// or wrapping your mutator in a [`hash::MutationChecker`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationResult {
-    /// The [`Mutator`] mutated this `Input`.
+    /// The [`Mutator`] executed on this `Input`. It may not guarantee that the input has actually been changed.
     Mutated,
     /// The [`Mutator`] did not mutate this `Input`. It was `Skipped`.
     Skipped,
@@ -157,12 +171,6 @@ pub trait MutatorsTuple<I, S>: HasLen {
 
         corpus_id: Option<CorpusId>,
     ) -> Result<(), Error>;
-
-    /// Gets all names of the wrapped [`Mutator`]`s`, reversed.
-    fn names_reversed(&self) -> Vec<&str>;
-
-    /// Gets all names of the wrapped [`Mutator`]`s`.
-    fn names(&self) -> Vec<&str>;
 }
 
 impl<I, S> MutatorsTuple<I, S> for () {
@@ -198,16 +206,6 @@ impl<I, S> MutatorsTuple<I, S> for () {
         _new_corpus_id: Option<CorpusId>,
     ) -> Result<(), Error> {
         Ok(())
-    }
-
-    #[inline]
-    fn names_reversed(&self) -> Vec<&str> {
-        Vec::new()
-    }
-
-    #[inline]
-    fn names(&self) -> Vec<&str> {
-        Vec::new()
     }
 }
 
@@ -258,18 +256,6 @@ where
         } else {
             self.1.get_and_post_exec(index - 1, state, new_corpus_id)
         }
-    }
-
-    fn names_reversed(&self) -> Vec<&str> {
-        let mut ret = self.1.names_reversed();
-        ret.push(self.0.name());
-        ret
-    }
-
-    fn names(&self) -> Vec<&str> {
-        let mut ret = self.names_reversed();
-        ret.reverse();
-        ret
     }
 }
 
@@ -325,14 +311,6 @@ where
     ) -> Result<(), Error> {
         self.0.get_and_post_exec(index, state, new_corpus_id)
     }
-
-    fn names(&self) -> Vec<&str> {
-        self.0.names()
-    }
-
-    fn names_reversed(&self) -> Vec<&str> {
-        self.0.names_reversed()
-    }
 }
 
 impl<Tail, I, S> IntoVec<Box<dyn Mutator<I, S>>> for (Tail,)
@@ -375,7 +353,7 @@ impl<I, S> MutatorsTuple<I, S> for Vec<Box<dyn Mutator<I, S>>> {
     ) -> Result<MutationResult, Error> {
         let mutator = self
             .get_mut(index.0)
-            .ok_or_else(|| Error::key_not_found("Mutator with id {index:?} not found."))?;
+            .ok_or_else(|| Error::key_not_found(format!("Mutator with id {index:?} not found.")))?;
         mutator.mutate(state, input)
     }
 
@@ -387,16 +365,8 @@ impl<I, S> MutatorsTuple<I, S> for Vec<Box<dyn Mutator<I, S>>> {
     ) -> Result<(), Error> {
         let mutator = self
             .get_mut(index)
-            .ok_or_else(|| Error::key_not_found("Mutator with id {index:?} not found."))?;
+            .ok_or_else(|| Error::key_not_found(format!("Mutator with id {index:?} not found.")))?;
         mutator.post_exec(state, new_corpus_id)
-    }
-
-    fn names_reversed(&self) -> Vec<&str> {
-        self.iter().rev().map(|x| x.name().as_ref()).collect()
-    }
-
-    fn names(&self) -> Vec<&str> {
-        self.iter().map(|x| x.name().as_ref()).collect()
     }
 }
 

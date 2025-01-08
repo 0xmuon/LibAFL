@@ -4,7 +4,6 @@ use std::{
     fs::{rename, File},
     io::Write,
     os::fd::{AsRawFd, FromRawFd},
-    ptr::addr_of_mut,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -37,7 +36,7 @@ use crate::{
     schedulers::MergeScheduler,
 };
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub fn merge(
     options: &LibfuzzerOptions,
     harness: &extern "C" fn(*const u8, usize) -> c_int,
@@ -98,7 +97,7 @@ pub fn merge(
         }
     }
 
-    let edges = unsafe { core::mem::take(&mut *addr_of_mut!(COUNTERS_MAPS)) };
+    let edges = unsafe { core::mem::take(&mut *&raw mut COUNTERS_MAPS) };
     let edges_observer = MultiMapObserver::new("edges", edges);
 
     let time = TimeObserver::new("time");
@@ -237,7 +236,7 @@ pub fn merge(
                     .on_remove(&mut state, id, &Some(testcase))?;
             } else {
                 // False-positive: file_path is used just below
-                #[allow(clippy::needless_borrows_for_generic_args)]
+                #[expect(clippy::needless_borrows_for_generic_args)]
                 rename(&file_path, &new_file_path)?;
                 *file_path = new_file_path;
             }

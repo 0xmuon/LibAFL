@@ -13,16 +13,17 @@ use num_traits::Bounded;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    corpus::{Corpus, SchedulerTestcaseMetadata},
+    corpus::{Corpus, HasCurrentCorpusId, SchedulerTestcaseMetadata},
     events::{Event, EventFirer, LogSeverity},
     executors::{Executor, ExitKind, HasObservers},
     feedbacks::{map::MapFeedbackMetadata, HasObserverHandle},
     fuzzer::Evaluator,
+    inputs::{Input, UsesInput},
     monitors::{AggregatorOps, UserStats, UserStatsValue},
     observers::{MapObserver, ObserversTuple},
     schedulers::powersched::SchedulerMetadata,
     stages::{RetryCountRestartHelper, Stage},
-    state::{HasCorpus, HasCurrentTestcase, HasExecutions, UsesState},
+    state::{HasCorpus, HasCurrentTestcase, HasExecutions},
     Error, HasMetadata, HasNamedMetadata,
 };
 
@@ -30,7 +31,7 @@ use crate::{
 /// Formula is same as AFL++: number of unstable entries divided by the number of filled entries.
 #[cfg_attr(
     any(not(feature = "serdeany_autoreg"), miri),
-    allow(clippy::unsafe_derive_deserialize)
+    expect(clippy::unsafe_derive_deserialize)
 )] // for SerdeAny
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UnstableEntriesMetadata {
@@ -72,48 +73,45 @@ impl Default for UnstableEntriesMetadata {
 pub const CALIBRATION_STAGE_NAME: &str = "calibration";
 /// The calibration stage will measure the average exec time and the target's stability for this input.
 #[derive(Clone, Debug)]
-pub struct CalibrationStage<C, E, O, OT> {
+pub struct CalibrationStage<C, E, O, OT, S> {
     map_observer_handle: Handle<C>,
     map_name: Cow<'static, str>,
     name: Cow<'static, str>,
     stage_max: usize,
     /// If we should track stability
     track_stability: bool,
-    phantom: PhantomData<(E, O, OT)>,
+    phantom: PhantomData<(E, O, OT, S)>,
 }
 
 const CAL_STAGE_START: usize = 4; // AFL++'s CAL_CYCLES_FAST + 1
 const CAL_STAGE_MAX: usize = 8; // AFL++'s CAL_CYCLES + 1
 
-impl<C, E, O, OT> UsesState for CalibrationStage<C, E, O, OT>
+impl<C, E, EM, O, OT, S, Z> Stage<E, EM, S, Z> for CalibrationStage<C, E, O, OT, S>
 where
-    E: UsesState,
-{
-    type State = E::State;
-}
-
-impl<C, E, EM, O, OT, Z> Stage<E, EM, Z> for CalibrationStage<C, E, O, OT>
-where
-    E: Executor<EM, Z> + HasObservers<Observers = OT>,
-    EM: EventFirer<State = Self::State>,
+    E: Executor<EM, Z, State = S> + HasObservers<Observers = OT>,
+    EM: EventFirer<State = S>,
     O: MapObserver,
     C: AsRef<O>,
-    for<'de> <O as MapObserver>::Entry: Serialize + Deserialize<'de> + 'static,
-    OT: ObserversTuple<Self::State>,
-    Self::State: HasCorpus + HasMetadata + HasNamedMetadata + HasExecutions,
-    Z: Evaluator<E, EM, State = Self::State>,
+    for<'de> <O as MapObserver>::Entry:
+        Serialize + Deserialize<'de> + 'static + Default + Debug + Bounded,
+    OT: ObserversTuple<<S::Corpus as Corpus>::Input, S>,
+    S: HasCorpus
+        + HasMetadata
+        + HasNamedMetadata
+        + HasExecutions
+        + HasCurrentTestcase
+        + HasCurrentCorpusId
+        + UsesInput<Input = <S::Corpus as Corpus>::Input>,
+    Z: Evaluator<E, EM, <S::Corpus as Corpus>::Input, S>,
+    <S::Corpus as Corpus>::Input: Input,
 {
     #[inline]
-    #[allow(
-        clippy::let_and_return,
-        clippy::too_many_lines,
-        clippy::cast_precision_loss
-    )]
+    #[expect(clippy::too_many_lines, clippy::cast_precision_loss)]
     fn perform(
         &mut self,
         fuzzer: &mut Z,
         executor: &mut E,
-        state: &mut Self::State,
+        state: &mut S,
         mgr: &mut EM,
     ) -> Result<(), Error> {
         // Run this stage only once for each corpus entry and only if we haven't already inspected it
@@ -207,16 +205,16 @@ where
                 .observers_mut()
                 .post_exec_all(state, &input, &exit_kind)?;
 
-            if self.track_stability {
+            if self.track_stability && exit_kind != ExitKind::Timeout {
                 let map = &executor.observers()[&self.map_observer_handle]
                     .as_ref()
                     .to_vec();
 
-                let history_map = &mut state
+                let map_state = state
                     .named_metadata_map_mut()
                     .get_mut::<MapFeedbackMetadata<O::Entry>>(&self.map_name)
-                    .unwrap()
-                    .history_map;
+                    .unwrap();
+                let history_map = &mut map_state.history_map;
 
                 if history_map.len() < map_first_len {
                     history_map.resize(map_first_len, O::Entry::default());
@@ -228,6 +226,10 @@ where
                     .enumerate()
                 {
                     if *first != *cur && *history != O::Entry::max_value() {
+                        // If we just hit a history map entry that was not covered before, but is now flagged as flaky,
+                        // we need to make sure the `num_covered_map_indexes` is kept in sync.
+                        map_state.num_covered_map_indexes +=
+                            usize::from(*history == O::Entry::default());
                         *history = O::Entry::max_value();
                         unstable_entries.push(idx);
                     };
@@ -260,16 +262,15 @@ where
             let observers = executor.observers();
             let map = observers[&self.map_observer_handle].as_ref();
 
-            let mut bitmap_size = map.count_bytes();
+            let bitmap_size = map.count_bytes();
 
             if bitmap_size < 1 {
                 return Err(Error::invalid_corpus(
-                    "This testcase doesnot trigger trigger any edges. Check your instrumentation!"
+                    "This testcase does not trigger any edges. Check your instrumentation!"
                         .to_string(),
                 ));
             }
 
-            bitmap_size = bitmap_size.max(1); // just don't make it 0 because we take log2 of it later.
             let psmeta = state
                 .metadata_map_mut()
                 .get_mut::<SchedulerMetadata>()
@@ -323,15 +324,19 @@ where
                     map_first_filled_count, 0,
                     "The map's filled count must never be 0"
                 );
+                // In theory `map_first_filled_count - unstable_entries` could be negative.
+                // Because `map_first_filled_count` is the filled count of just one single run.
+                // While the `unstable_entries` is the number of all the unstable entries across multiple runs.
+                // If the target is very unstable (~100%) then this would hit more edges than `map_first_filled_count`.
+                // But even in that case, we don't allow negative stability and just show 0% here.
+                let stable_count: u64 =
+                    map_first_filled_count.saturating_sub(unstable_entries) as u64;
                 mgr.fire(
                     state,
                     Event::UpdateUserStats {
                         name: Cow::from("stability"),
                         value: UserStats::new(
-                            UserStatsValue::Ratio(
-                                (map_first_filled_count - unstable_entries) as u64,
-                                map_first_filled_count as u64,
-                            ),
+                            UserStatsValue::Ratio(stable_count, map_first_filled_count as u64),
                             AggregatorOps::Avg,
                         ),
                         phantom: PhantomData,
@@ -358,7 +363,7 @@ where
         Ok(())
     }
 
-    fn should_restart(&mut self, state: &mut Self::State) -> Result<bool, Error> {
+    fn should_restart(&mut self, state: &mut S) -> Result<bool, Error> {
         // Calibration stage disallow restarts
         // If a testcase that causes crash/timeout in the queue, we need to remove it from the queue immediately.
         RetryCountRestartHelper::no_retry(state, &self.name)
@@ -367,19 +372,19 @@ where
         // remove this guy from corpus queue
     }
 
-    fn clear_progress(&mut self, state: &mut Self::State) -> Result<(), Error> {
+    fn clear_progress(&mut self, state: &mut S) -> Result<(), Error> {
         // TODO: Make sure this is the correct way / there may be a better way?
         RetryCountRestartHelper::clear_progress(state, &self.name)
     }
 }
 
-impl<C, E, O, OT> CalibrationStage<C, E, O, OT>
+impl<C, E, O, OT, S> CalibrationStage<C, E, O, OT, S>
 where
     O: MapObserver,
     for<'it> O: AsIter<'it, Item = O::Entry>,
     C: AsRef<O>,
-    OT: ObserversTuple<<Self as UsesState>::State>,
-    E: UsesState,
+    OT: ObserversTuple<<S::Corpus as Corpus>::Input, S>,
+    S: HasCorpus,
 {
     /// Create a new [`CalibrationStage`].
     #[must_use]
@@ -412,7 +417,7 @@ where
     }
 }
 
-impl<C, E, O, OT> Named for CalibrationStage<C, E, O, OT> {
+impl<C, E, O, OT, S> Named for CalibrationStage<C, E, O, OT, S> {
     fn name(&self) -> &Cow<'static, str> {
         &self.name
     }

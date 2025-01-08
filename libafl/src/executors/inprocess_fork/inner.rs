@@ -2,7 +2,7 @@ use core::{
     ffi::c_void,
     fmt::{self, Debug, Formatter},
     marker::PhantomData,
-    ptr::{self, addr_of_mut, null_mut, write_volatile},
+    ptr::{self, null_mut, write_volatile},
     sync::atomic::{compiler_fence, Ordering},
     time::Duration,
 };
@@ -29,21 +29,13 @@ use crate::{
         ExitKind, HasObservers,
     },
     inputs::UsesInput,
-    observers::{ObserversTuple, UsesObservers},
+    observers::ObserversTuple,
     state::{State, UsesState},
     Error,
 };
 
 /// Inner state of GenericInProcessExecutor-like structures.
-pub struct GenericInProcessForkExecutorInner<HT, OT, S, SP, EM, Z>
-where
-    OT: ObserversTuple<S>,
-    S: UsesInput,
-    SP: ShMemProvider,
-    HT: ExecutorHooksTuple<S>,
-    EM: UsesState<State = S>,
-    Z: UsesState<State = S>,
-{
+pub struct GenericInProcessForkExecutorInner<HT, OT, S, SP, EM, Z> {
     pub(super) hooks: (InChildProcessHooks<S>, HT),
     pub(super) shmem_provider: SP,
     pub(super) observers: OT,
@@ -56,12 +48,9 @@ where
 
 impl<HT, OT, S, SP, EM, Z> Debug for GenericInProcessForkExecutorInner<HT, OT, S, SP, EM, Z>
 where
-    OT: ObserversTuple<S> + Debug,
-    S: UsesInput,
-    SP: ShMemProvider,
-    HT: ExecutorHooksTuple<S> + Debug,
-    EM: UsesState<State = S>,
-    Z: UsesState<State = S>,
+    HT: Debug,
+    OT: Debug,
+    SP: Debug,
 {
     #[cfg(target_os = "linux")]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -86,24 +75,52 @@ where
 
 impl<HT, OT, S, SP, EM, Z> UsesState for GenericInProcessForkExecutorInner<HT, OT, S, SP, EM, Z>
 where
-    OT: ObserversTuple<S>,
     S: State,
-    SP: ShMemProvider,
-    HT: ExecutorHooksTuple<S>,
-    EM: UsesState<State = S>,
-    Z: UsesState<State = S>,
 {
     type State = S;
 }
 
+#[cfg(target_os = "linux")]
+fn parse_itimerspec(timeout: Duration) -> libc::itimerspec {
+    let milli_sec = timeout.as_millis();
+    let it_value = libc::timespec {
+        tv_sec: (milli_sec / 1000) as _,
+        tv_nsec: ((milli_sec % 1000) * 1000 * 1000) as _,
+    };
+    let it_interval = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    libc::itimerspec {
+        it_interval,
+        it_value,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parse_itimerval(timeout: Duration) -> Itimerval {
+    let milli_sec = timeout.as_millis();
+    let it_value = Timeval {
+        tv_sec: (milli_sec / 1000) as i64,
+        tv_usec: (milli_sec % 1000) as i64,
+    };
+    let it_interval = Timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    Itimerval {
+        it_interval,
+        it_value,
+    }
+}
+
 impl<EM, HT, OT, S, SP, Z> GenericInProcessForkExecutorInner<HT, OT, S, SP, EM, Z>
 where
-    OT: ObserversTuple<S> + Debug,
+    OT: ObserversTuple<S::Input, S> + Debug,
     S: State + UsesInput,
     SP: ShMemProvider,
     HT: ExecutorHooksTuple<S>,
     EM: EventFirer<State = S> + EventRestarter<State = S>,
-    Z: UsesState<State = S>,
 {
     pub(super) unsafe fn pre_run_target_child(
         &mut self,
@@ -126,10 +143,10 @@ where
             let mut timerid: libc::timer_t = null_mut();
             // creates a new per-process interval timer
             // we can't do this from the parent, timerid is unique to each process.
-            libc::timer_create(libc::CLOCK_MONOTONIC, null_mut(), addr_of_mut!(timerid));
+            libc::timer_create(libc::CLOCK_MONOTONIC, null_mut(), &raw mut timerid);
 
             // log::info!("Set timer! {:#?} {timerid:#?}", self.itimerspec);
-            let _: i32 = libc::timer_settime(timerid, 0, addr_of_mut!(self.itimerspec), null_mut());
+            let _: i32 = libc::timer_settime(timerid, 0, &raw mut self.itimerspec, null_mut());
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -194,10 +211,7 @@ impl<HT, OT, S, SP, EM, Z> GenericInProcessForkExecutorInner<HT, OT, S, SP, EM, 
 where
     HT: ExecutorHooksTuple<S>,
     S: State,
-    OT: ObserversTuple<S>,
-    SP: ShMemProvider,
-    EM: EventFirer<State = S> + EventRestarter<State = S>,
-    Z: UsesState<State = S>,
+    OT: ObserversTuple<S::Input, S>,
 {
     #[inline]
     /// This function marks the boundary between the fuzzer and the target.
@@ -209,17 +223,17 @@ where
         input: &<Self as UsesInput>::Input,
     ) {
         unsafe {
-            let data = addr_of_mut!(FORK_EXECUTOR_GLOBAL_DATA);
+            let data = &raw mut FORK_EXECUTOR_GLOBAL_DATA;
             write_volatile(
-                addr_of_mut!((*data).executor_ptr),
+                &raw mut (*data).executor_ptr,
                 ptr::from_ref(self) as *const c_void,
             );
             write_volatile(
-                addr_of_mut!((*data).current_input_ptr),
+                &raw mut (*data).current_input_ptr,
                 ptr::from_ref(input) as *const c_void,
             );
             write_volatile(
-                addr_of_mut!((*data).state_ptr),
+                &raw mut ((*data).state_ptr),
                 ptr::from_mut(state) as *mut c_void,
             );
             compiler_fence(Ordering::SeqCst);
@@ -240,7 +254,6 @@ where
 
     /// Creates a new [`GenericInProcessForkExecutorInner`] with custom hooks
     #[cfg(target_os = "linux")]
-    #[allow(clippy::too_many_arguments)]
     pub fn with_hooks(
         userhooks: HT,
         observers: OT,
@@ -253,21 +266,7 @@ where
         let default_hooks = InChildProcessHooks::new::<Self>()?;
         let mut hooks = tuple_list!(default_hooks).merge(userhooks);
         hooks.init_all::<Self>(state);
-
-        let milli_sec = timeout.as_millis();
-        let it_value = libc::timespec {
-            tv_sec: (milli_sec / 1000) as _,
-            tv_nsec: ((milli_sec % 1000) * 1000 * 1000) as _,
-        };
-        let it_interval = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        let itimerspec = libc::itimerspec {
-            it_interval,
-            it_value,
-        };
-
+        let itimerspec = parse_itimerspec(timeout);
         Ok(Self {
             shmem_provider,
             observers,
@@ -279,7 +278,6 @@ where
 
     /// Creates a new [`GenericInProcessForkExecutorInner`], non linux
     #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::too_many_arguments)]
     pub fn with_hooks(
         userhooks: HT,
         observers: OT,
@@ -293,19 +291,7 @@ where
         let mut hooks = tuple_list!(default_hooks).merge(userhooks);
         hooks.init_all::<Self>(state);
 
-        let milli_sec = timeout.as_millis();
-        let it_value = Timeval {
-            tv_sec: (milli_sec / 1000) as i64,
-            tv_usec: (milli_sec % 1000) as i64,
-        };
-        let it_interval = Timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        };
-        let itimerval = Itimerval {
-            it_interval,
-            it_value,
-        };
+        let itimerval = parse_itimerval(timeout);
 
         Ok(Self {
             shmem_provider,
@@ -317,27 +303,13 @@ where
     }
 }
 
-impl<HT, OT, S, SP, EM, Z> UsesObservers for GenericInProcessForkExecutorInner<HT, OT, S, SP, EM, Z>
-where
-    HT: ExecutorHooksTuple<S>,
-    OT: ObserversTuple<S>,
-    S: State,
-    SP: ShMemProvider,
-    EM: UsesState<State = S>,
-    Z: UsesState<State = S>,
-{
-    type Observers = OT;
-}
-
 impl<HT, OT, S, SP, EM, Z> HasObservers for GenericInProcessForkExecutorInner<HT, OT, S, SP, EM, Z>
 where
-    HT: ExecutorHooksTuple<S>,
+    OT: ObserversTuple<S::Input, S>,
     S: State,
-    OT: ObserversTuple<S>,
-    SP: ShMemProvider,
-    EM: UsesState<State = S>,
-    Z: UsesState<State = S>,
 {
+    type Observers = OT;
+
     #[inline]
     fn observers(&self) -> RefIndexable<&Self::Observers, Self::Observers> {
         RefIndexable::from(&self.observers)

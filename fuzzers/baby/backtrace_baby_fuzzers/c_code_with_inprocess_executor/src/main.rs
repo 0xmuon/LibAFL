@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, ptr::NonNull};
 
 use libafl::{
     corpus::{InMemoryCorpus, OnDiskCorpus},
@@ -10,13 +10,13 @@ use libafl::{
     generators::RandPrintablesGenerator,
     inputs::{BytesInput, HasTargetBytes},
     monitors::SimpleMonitor,
-    mutators::scheduled::{havoc_mutations, StdScheduledMutator},
+    mutators::{havoc_mutations::havoc_mutations, scheduled::StdScheduledMutator},
     observers::{BacktraceObserver, ConstMapObserver},
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
     state::StdState,
 };
-use libafl_bolts::{rands::StdRand, tuples::tuple_list, AsSlice};
+use libafl_bolts::{nonzero, rands::StdRand, tuples::tuple_list, AsSlice};
 use libc::c_uchar;
 extern crate libc;
 
@@ -26,7 +26,6 @@ extern "C" {
 
 }
 
-#[allow(clippy::similar_names)]
 pub fn main() {
     let mut harness = |input: &BytesInput| {
         let target = input.target_bytes();
@@ -35,7 +34,14 @@ pub fn main() {
         libafl::executors::ExitKind::Ok
     };
     // Create an observation channel using the signals map
-    let observer = unsafe { ConstMapObserver::<u8, 3>::from_mut_ptr("signals", array_ptr) };
+    let observer = unsafe {
+        ConstMapObserver::from_mut_ptr(
+            "signals",
+            NonNull::new(array_ptr)
+                .expect("map ptr is null")
+                .cast::<[u8; 3]>(),
+        )
+    };
     // Create a stacktrace observer
     let bt_observer = BacktraceObserver::owned(
         "BacktraceObserver",
@@ -89,7 +95,7 @@ pub fn main() {
     .expect("Failed to create the Executor");
 
     // Generator of printable bytearrays of max size 32
-    let mut generator = RandPrintablesGenerator::new(32);
+    let mut generator = RandPrintablesGenerator::new(nonzero!(32));
 
     // Generate 8 initial inputs
     state

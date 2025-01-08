@@ -143,8 +143,7 @@ fn find_llvm_version() -> Option<i32> {
     None
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(unused)]
+#[expect(clippy::too_many_arguments)]
 fn build_pass(
     bindir_path: &Path,
     out_dir: &Path,
@@ -200,34 +199,31 @@ fn build_pass(
     };
 
     match command_result {
-        Some(res) => {
-            match res {
-                Ok(s) => {
-                    if !s.success() {
-                        if required {
-                            panic!("Failed to compile required compiler pass src/{src_file} - Exit status: {s}");
-                        } else {
-                            println!("cargo:warning=Skipping non-required compiler pass src/{src_file} - Reason: Exit status {s}");
-                        }
-                    }
-                }
-                Err(err) => {
+        Some(res) => match res {
+            Ok(s) => {
+                if !s.success() {
                     if required {
-                        panic!("Failed to compile required compiler pass src/{src_file} - Error: {err}");
+                        panic!("Failed to compile required compiler pass src/{src_file} - Exit status: {s}");
                     } else {
-                        println!("cargo:warning=Skipping non-required compiler pass src/{src_file} - Error: {err}");
+                        println!("cargo:warning=Skipping non-required compiler pass src/{src_file} - Reason: Exit status {s}. You can ignore this error unless you want this compiler pass.");
                     }
                 }
             }
-        }
+            Err(err) => {
+                if required {
+                    panic!("Failed to compile required compiler pass src/{src_file} - Exit status: {err}");
+                } else {
+                    println!("cargo:warning=Skipping non-required compiler pass src/{src_file} - Reason: Exit status {err}. You can ignore this error unless you want this compiler pass.");
+                }
+            }
+        },
         None => {
             println!("cargo:warning=Skipping compiler pass src/{src_file} - Only supported on Windows or *nix.");
         }
     }
 }
 
-#[allow(clippy::single_element_loop)]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn main() {
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let out_dir = Path::new(&out_dir);
@@ -238,16 +234,18 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=LLVM_CONFIG");
     println!("cargo:rerun-if-env-changed=LLVM_BINDIR");
+    println!("cargo:rerun-if-env-changed=LLVM_AR_PATH");
     println!("cargo:rerun-if-env-changed=LLVM_CXXFLAGS");
     println!("cargo:rerun-if-env-changed=LLVM_LDFLAGS");
     println!("cargo:rerun-if-env-changed=LLVM_VERSION");
-    println!("cargo:rerun-if-env-changed=LIBAFL_EDGES_MAP_SIZE_IN_USE");
+    println!("cargo:rerun-if-env-changed=LIBAFL_EDGES_MAP_DEFAULT_SIZE");
     println!("cargo:rerun-if-env-changed=LIBAFL_ACCOUNTING_MAP_SIZE");
     println!("cargo:rerun-if-env-changed=LIBAFL_DDG_MAP_SIZE");
     println!("cargo:rerun-if-changed=src/common-llvm.h");
     println!("cargo:rerun-if-changed=build.rs");
 
     let llvm_bindir = env::var("LLVM_BINDIR");
+    let llvm_ar_path = env::var("LLVM_AR_PATH");
     let llvm_cxxflags = env::var("LLVM_CXXFLAGS");
     let llvm_ldflags = env::var("LLVM_LDFLAGS");
     let llvm_version = env::var("LLVM_VERSION");
@@ -270,6 +268,8 @@ fn main() {
 pub const CLANG_PATH: &str = \"clang\";
 /// The path to the `clang++` executable
 pub const CLANGXX_PATH: &str = \"clang++\";
+/// The path to the `llvm-ar` executable
+pub const LLVM_AR_PATH: &str = \"llvm-ar\";
 /// The llvm version used to build llvm passes
 pub const LIBAFL_CC_LLVM_VERSION: Option<usize> = None;
     "
@@ -285,16 +285,24 @@ pub const LIBAFL_CC_LLVM_VERSION: Option<usize> = None;
         exec_llvm_config(&["--bindir"])
     };
     let bindir_path = Path::new(&llvm_bindir);
+    let llvm_ar_path = if let Ok(ar_path) = llvm_ar_path {
+        ar_path
+    } else {
+        exec_llvm_config(&["--bindir"])
+    };
 
     let clang;
     let clangcpp;
+    let llvm_ar;
 
     if cfg!(windows) {
         clang = bindir_path.join("clang.exe");
         clangcpp = bindir_path.join("clang++.exe");
+        llvm_ar = Path::new(&llvm_ar_path).join("llvm-ar.exe");
     } else {
         clang = bindir_path.join("clang");
         clangcpp = bindir_path.join("clang++");
+        llvm_ar = Path::new(&llvm_ar_path).join("llvm-ar");
     }
 
     if !clang.exists() {
@@ -306,6 +314,10 @@ pub const LIBAFL_CC_LLVM_VERSION: Option<usize> = None;
         println!("cargo:warning=Failed to find clang++ frontend.");
         return;
     }
+    if !llvm_ar.exists() {
+        println!("cargo:warning=Failed to find llvm-ar archiver.");
+        return;
+    }
 
     let cxxflags = if let Ok(flags) = llvm_cxxflags {
         flags
@@ -314,13 +326,13 @@ pub const LIBAFL_CC_LLVM_VERSION: Option<usize> = None;
     };
     let mut cxxflags: Vec<String> = cxxflags.split_whitespace().map(String::from).collect();
 
-    let edges_map_size_in_use: usize = option_env!("LIBAFL_EDGES_MAP_SIZE_IN_USE")
+    let edge_map_default_size: usize = option_env!("LIBAFL_EDGES_MAP_DEFAULT_SIZE")
         .map_or(Ok(65_536), str::parse)
-        .expect("Could not parse LIBAFL_EDGES_MAP_SIZE_IN_USE");
-    let edges_map_size_max: usize = option_env!("LIBAFL_EDGES_MAP_SIZE_MAX")
+        .expect("Could not parse LIBAFL_EDGES_MAP_DEFAULT_SIZE");
+    let edge_map_allocated_size: usize = option_env!("LIBAFL_EDGES_MAP_ALLOCATED_SIZE")
         .map_or(Ok(2_621_440), str::parse)
-        .expect("Could not parse LIBAFL_EDGES_MAP_SIZE_IN_USE");
-    cxxflags.push(format!("-DEDGES_MAP_SIZE_IN_USE={edges_map_size_in_use}"));
+        .expect("Could not parse LIBAFL_EDGES_MAP_DEFAULT_SIZE");
+    cxxflags.push(format!("-DEDGES_MAP_DEFAULT_SIZE={edge_map_default_size}"));
 
     let acc_map_size: usize = option_env!("LIBAFL_ACCOUNTING_MAP_SIZE")
         .map_or(Ok(65_536), str::parse)
@@ -348,11 +360,13 @@ pub const LIBAFL_CC_LLVM_VERSION: Option<usize> = None;
         pub const CLANG_PATH: &str = {clang:?};
         /// The path to the `clang++` executable
         pub const CLANGXX_PATH: &str = {clangcpp:?};
+        /// The path to the `llvm-ar` executable
+        pub const LLVM_AR_PATH: &str = {llvm_ar:?};
 
         /// The default size of the edges map the fuzzer uses
-        pub const EDGES_MAP_SIZE_IN_USE: usize = {edges_map_size_in_use};
+        pub const EDGES_MAP_DEFAULT_SIZE: usize = {edge_map_default_size};
         /// The real allocated size of the edges map
-        pub const EDGES_MAP_SIZE_MAX: usize = {edges_map_size_max};
+        pub const EDGES_MAP_ALLOCATED_SIZE: usize = {edge_map_allocated_size};
 
         /// The size of the accounting maps
         pub const ACCOUNTING_MAP_SIZE: usize = {acc_map_size};

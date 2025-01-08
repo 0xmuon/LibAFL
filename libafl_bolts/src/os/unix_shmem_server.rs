@@ -13,7 +13,6 @@ use alloc::{
 use core::{
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
-    ptr::addr_of,
 };
 #[cfg(target_vendor = "apple")]
 use std::fs;
@@ -120,7 +119,7 @@ where
     SP: ShMemProvider,
 {
     /// Send a request to the server, and wait for a response
-    #[allow(clippy::similar_names)] // id and fd
+    #[expect(clippy::similar_names)] // id and fd
     fn send_receive(&mut self, request: ServedShMemRequest) -> Result<(i32, i32), Error> {
         //let bt = Backtrace::new();
         //log::info!("Sending {:?} with bt:\n{:?}", request, bt);
@@ -410,7 +409,6 @@ where
             };
         }
 
-        #[allow(clippy::mutex_atomic)]
         let syncpair = Arc::new((Mutex::new(ShMemServiceStatus::Starting), Condvar::new()));
         let childsyncpair = Arc::clone(&syncpair);
         let join_handle = thread::spawn(move || {
@@ -473,7 +471,7 @@ where
 }
 
 /// The struct for the worker, handling incoming requests for [`ShMem`].
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 struct ServedShMemServiceWorker<SP>
 where
     SP: ShMemProvider,
@@ -568,7 +566,7 @@ where
 
                 if client.maps.contains_key(&description_id) {
                     // Using let else here as self needs to be accessed in the else branch.
-                    #[allow(clippy::option_if_let_else)]
+                    #[expect(clippy::option_if_let_else)]
                     Ok(ServedShMemResponse::Mapping(
                         if let Some(map) = client
                             .maps
@@ -694,7 +692,7 @@ where
             let copied_poll_fds: Vec<PollFd> = poll_fds.clone();
             for poll_fd in copied_poll_fds {
                 let revents = poll_fd.revents().expect("revents should not be None");
-                let raw_polled_fd = unsafe { *((addr_of!(poll_fd)) as *const libc::pollfd) }.fd;
+                let raw_polled_fd = unsafe { *((&raw const poll_fd) as *const libc::pollfd) }.fd;
                 if revents.contains(PollFlags::POLLHUP) {
                     poll_fds.remove(poll_fds.iter().position(|item| *item == poll_fd).unwrap());
                     self.clients.remove(&raw_polled_fd);

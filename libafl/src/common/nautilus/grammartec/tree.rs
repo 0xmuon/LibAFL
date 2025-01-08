@@ -6,7 +6,7 @@ use libafl_bolts::rands::Rand;
 use pyo3::{
     prelude::{PyObject, PyResult, Python},
     types::{PyAnyMethods, PyBytes, PyBytesMethods, PyString, PyStringMethods, PyTuple},
-    FromPyObject, PyTypeInfo,
+    PyTypeInfo,
 };
 use serde::{Deserialize, Serialize};
 
@@ -85,13 +85,13 @@ impl<'data, 'tree: 'data, 'ctx: 'data, W: Write, T: TreeLike> Unparser<'data, 't
             .into_iter()
             .map(io::Cursor::into_inner)
             .collect::<Vec<_>>();
-        let byte_arrays = bufs.iter().map(|b| PyBytes::new_bound(py, b));
-        let res = expr.call1(py, PyTuple::new_bound(py, byte_arrays))?;
+        let byte_arrays = bufs.iter().map(|b| PyBytes::new(py, b));
+        let res = expr.call1(py, PyTuple::new(py, byte_arrays)?)?;
         let bound = res.bind(py);
-        if PyString::is_type_of_bound(bound) {
+        if PyString::is_type_of(bound) {
             let pystr = bound.downcast::<PyString>()?;
             self.write(pystr.to_string_lossy().as_bytes());
-        } else if PyBytes::is_type_of_bound(bound) {
+        } else if PyBytes::is_type_of(bound) {
             let pybytes = bound.downcast::<PyBytes>()?;
             self.write(pybytes.as_bytes());
         } else {
@@ -211,9 +211,11 @@ impl TreeLike for Tree {
     fn get_rule<'c>(&self, n: NodeId, ctx: &'c Context) -> &'c Rule {
         ctx.get_rule(self.get_rule_id(n))
     }
+
     fn get_custom_rule_data(&self, n: NodeId) -> &[u8] {
         self.rules[n.to_i()].data()
     }
+
     fn get_rule_or_custom(&self, n: NodeId) -> &RuleIdOrCustom {
         &self.rules[n.to_i()]
     }
@@ -240,6 +242,7 @@ impl Tree {
         self.rules[n.to_i()].id()
     }
 
+    #[expect(dead_code)]
     fn get_rule_or_custom(&self, n: NodeId) -> &RuleIdOrCustom {
         &self.rules[n.to_i()]
     }
@@ -258,11 +261,11 @@ impl Tree {
     ) -> TreeMutation<'a> {
         let old_size = self.subtree_size(n);
         let new_size = other.subtree_size(other_node);
-        return TreeMutation {
+        TreeMutation {
             prefix: self.slice(0.into(), n),
             repl: other.slice(other_node, other_node + new_size),
             postfix: self.slice(n + old_size, self.rules.len().into()),
-        };
+        }
     }
 
     fn calc_subtree_sizes_and_parents(&mut self, ctx: &Context) {
@@ -384,6 +387,7 @@ impl Tree {
         }
     }
 
+    #[expect(dead_code)]
     fn find_recursions_iter(&self, ctx: &Context) -> Vec<(NodeId, NodeId)> {
         let mut found_recursions = Vec::new();
         //Only search for iterations for up to 10000 nodes
@@ -434,7 +438,7 @@ impl<'a> TreeMutation<'a> {
     }
 }
 
-impl<'a> TreeLike for TreeMutation<'a> {
+impl TreeLike for TreeMutation<'_> {
     fn get_rule_id(&self, n: NodeId) -> RuleId {
         self.get_at(n).id()
     }
@@ -442,6 +446,7 @@ impl<'a> TreeLike for TreeMutation<'a> {
     fn size(&self) -> usize {
         self.prefix.len() + self.repl.len() + self.postfix.len()
     }
+
     fn get_rule_or_custom(&self, n: NodeId) -> &RuleIdOrCustom {
         self.get_at(n)
     }
@@ -455,7 +460,7 @@ impl<'a> TreeLike for TreeMutation<'a> {
     }
 
     fn get_rule<'c>(&self, n: NodeId, ctx: &'c Context) -> &'c Rule {
-        return ctx.get_rule(self.get_rule_id(n));
+        ctx.get_rule(self.get_rule_id(n))
     }
     fn get_custom_rule_data(&self, n: NodeId) -> &[u8] {
         self.get_at(n).data()

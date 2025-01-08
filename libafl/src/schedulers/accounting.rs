@@ -7,19 +7,18 @@ use core::{
 };
 
 use hashbrown::HashMap;
-use libafl_bolts::{rands::Rand, HasLen, HasRefCnt};
+use libafl_bolts::{rands::Rand, tuples::MatchName, HasLen, HasRefCnt};
 use serde::{Deserialize, Serialize};
 
+use super::IndexesLenTimeMinimizerScheduler;
 use crate::{
     corpus::{Corpus, CorpusId},
-    feedbacks::MapIndexesMetadata,
-    inputs::UsesInput,
-    observers::{CanTrack, ObserversTuple},
+    observers::CanTrack,
     schedulers::{
         minimizer::{IsFavoredMetadata, MinimizerScheduler, DEFAULT_SKIP_NON_FAVORED_PROB},
-        LenTimeMulTestcaseScore, Scheduler,
+        Scheduler,
     },
-    state::{HasCorpus, HasRand, UsesState},
+    state::{HasCorpus, HasRand},
     Error, HasMetadata,
 };
 
@@ -27,7 +26,7 @@ use crate::{
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(
     any(not(feature = "serdeany_autoreg"), miri),
-    allow(clippy::unsafe_derive_deserialize)
+    expect(clippy::unsafe_derive_deserialize)
 )] // for SerdeAny
 pub struct AccountingIndexesMetadata {
     /// The list of indexes.
@@ -78,7 +77,7 @@ impl AccountingIndexesMetadata {
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(
     any(not(feature = "serdeany_autoreg"), miri),
-    allow(clippy::unsafe_derive_deserialize)
+    expect(clippy::unsafe_derive_deserialize)
 )] // for SerdeAny
 pub struct TopAccountingMetadata {
     /// map index -> corpus index
@@ -105,59 +104,41 @@ impl TopAccountingMetadata {
 
 /// A minimizer scheduler using coverage accounting
 #[derive(Debug)]
-pub struct CoverageAccountingScheduler<'a, CS, O>
-where
-    CS: UsesState,
-    CS::State: Debug,
-{
+pub struct CoverageAccountingScheduler<'a, CS, O> {
     accounting_map: &'a [u32],
     skip_non_favored_prob: f64,
-    inner: MinimizerScheduler<
-        CS,
-        LenTimeMulTestcaseScore<<CS as UsesState>::State>,
-        MapIndexesMetadata,
-        O,
-    >,
+    inner: IndexesLenTimeMinimizerScheduler<CS, O>,
 }
 
-impl<'a, CS, O> UsesState for CoverageAccountingScheduler<'a, CS, O>
+impl<CS, O, S> Scheduler<<S::Corpus as Corpus>::Input, S> for CoverageAccountingScheduler<'_, CS, O>
 where
-    CS: UsesState,
-    CS::State: Debug,
-{
-    type State = CS::State;
-}
-
-impl<'a, CS, O> Scheduler for CoverageAccountingScheduler<'a, CS, O>
-where
-    CS: Scheduler,
-    Self::State: HasCorpus + HasMetadata + HasRand,
-    CS::State: Debug,
-    <Self::State as UsesInput>::Input: HasLen,
+    CS: Scheduler<<S::Corpus as Corpus>::Input, S>,
+    S: HasCorpus + HasMetadata + HasRand,
+    <S::Corpus as Corpus>::Input: HasLen,
     O: CanTrack,
 {
-    fn on_add(&mut self, state: &mut Self::State, id: CorpusId) -> Result<(), Error> {
+    fn on_add(&mut self, state: &mut S, id: CorpusId) -> Result<(), Error> {
         self.update_accounting_score(state, id)?;
         self.inner.on_add(state, id)
     }
 
     fn on_evaluation<OT>(
         &mut self,
-        state: &mut Self::State,
-        input: &<Self::State as UsesInput>::Input,
+        state: &mut S,
+        input: &<S::Corpus as Corpus>::Input,
         observers: &OT,
     ) -> Result<(), Error>
     where
-        OT: ObserversTuple<Self::State>,
+        OT: MatchName,
     {
         self.inner.on_evaluation(state, input, observers)
     }
 
-    fn next(&mut self, state: &mut Self::State) -> Result<CorpusId, Error> {
+    fn next(&mut self, state: &mut S) -> Result<CorpusId, Error> {
         if state
             .metadata_map()
             .get::<TopAccountingMetadata>()
-            .map_or(false, |x| x.changed)
+            .is_some_and(|x| x.changed)
         {
             self.accounting_cull(state)?;
         } else {
@@ -184,7 +165,7 @@ where
     /// Set current fuzzed corpus id and `scheduled_count`
     fn set_current_scheduled(
         &mut self,
-        _state: &mut Self::State,
+        _state: &mut S,
         _next_id: Option<CorpusId>,
     ) -> Result<(), Error> {
         // We do nothing here, the inner scheduler will take care of it
@@ -194,19 +175,14 @@ where
 
 impl<'a, CS, O> CoverageAccountingScheduler<'a, CS, O>
 where
-    CS: Scheduler,
-    CS::State: HasCorpus + HasMetadata + HasRand + Debug,
-    <CS::State as UsesInput>::Input: HasLen,
     O: CanTrack,
 {
     /// Update the `Corpus` score
-    #[allow(clippy::unused_self)]
-    #[allow(clippy::cast_possible_wrap)]
-    pub fn update_accounting_score(
-        &self,
-        state: &mut CS::State,
-        id: CorpusId,
-    ) -> Result<(), Error> {
+    #[expect(clippy::cast_possible_wrap)]
+    pub fn update_accounting_score<S>(&self, state: &mut S, id: CorpusId) -> Result<(), Error>
+    where
+        S: HasCorpus + HasMetadata,
+    {
         let mut indexes = vec![];
         let mut new_favoreds = vec![];
         {
@@ -290,8 +266,10 @@ where
     }
 
     /// Cull the `Corpus`
-    #[allow(clippy::unused_self)]
-    pub fn accounting_cull(&self, state: &CS::State) -> Result<(), Error> {
+    pub fn accounting_cull<S>(&self, state: &S) -> Result<(), Error>
+    where
+        S: HasCorpus + HasMetadata,
+    {
         let Some(top_rated) = state.metadata_map().get::<TopAccountingMetadata>() else {
             return Ok(());
         };
@@ -312,7 +290,10 @@ where
     /// and has a default probability to skip non-faved Testcases of [`DEFAULT_SKIP_NON_FAVORED_PROB`].
     ///
     /// Provide the observer responsible for determining new indexes.
-    pub fn new(observer: &O, state: &mut CS::State, base: CS, accounting_map: &'a [u32]) -> Self {
+    pub fn new<S>(observer: &O, state: &mut S, base: CS, accounting_map: &'a [u32]) -> Self
+    where
+        S: HasMetadata,
+    {
         match state.metadata_map().get::<TopAccountingMetadata>() {
             Some(meta) => {
                 if meta.max_accounting.len() != accounting_map.len() {
@@ -334,13 +315,16 @@ where
     /// and has a non-default probability to skip non-faved Testcases using (`skip_non_favored_prob`).
     ///
     /// Provide the observer responsible for determining new indexes.
-    pub fn with_skip_prob(
+    pub fn with_skip_prob<S>(
         observer: &O,
-        state: &mut CS::State,
+        state: &mut S,
         base: CS,
         skip_non_favored_prob: f64,
         accounting_map: &'a [u32],
-    ) -> Self {
+    ) -> Self
+    where
+        S: HasMetadata,
+    {
         match state.metadata_map().get::<TopAccountingMetadata>() {
             Some(meta) => {
                 if meta.max_accounting.len() != accounting_map.len() {

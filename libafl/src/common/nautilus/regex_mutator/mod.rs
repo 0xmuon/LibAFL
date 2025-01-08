@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::num::NonZero;
 
 use libafl_bolts::rands::Rand;
 use regex_syntax::hir::{Class, ClassBytesRange, ClassUnicodeRange, Hir, Literal};
@@ -22,10 +23,12 @@ impl RegexScript {
     }
 
     pub fn get_mod<R: Rand>(&mut self, rand: &mut R, val: usize) -> usize {
-        if self.remaining == 0 {
+        if self.remaining == 0 || val == 0 {
             0
         } else {
-            rand.below(val)
+            // # Safety
+            // This is checked above to be non-null.
+            rand.below(unsafe { NonZero::new(val).unwrap_unchecked() })
         }
     }
 
@@ -126,10 +129,10 @@ pub fn generate<R: Rand>(rand: &mut R, hir: &Hir) -> Vec<u8> {
             HirKind::Empty => {}
             HirKind::Literal(lit) => append_lit(&mut res, lit),
             HirKind::Class(cls) => append_class(rand, &mut res, &mut scr, cls),
-            HirKind::Repetition(rep) => {
-                let num = get_repetitions(rand, rep.min, rep.max, &mut scr);
+            HirKind::Repetition(repetition) => {
+                let num = get_repetitions(rand, repetition.min, repetition.max, &mut scr);
                 for _ in 0..num {
-                    stack.push(&rep.sub);
+                    stack.push(&repetition.sub);
                 }
             }
             HirKind::Capture(grp) => stack.push(&grp.sub),

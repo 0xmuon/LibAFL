@@ -9,21 +9,23 @@ use libafl::monitors::SimpleMonitor;
 use libafl::{
     corpus::{InMemoryCorpus, OnDiskCorpus},
     events::SimpleEventManager,
-    executors::{inprocess::InProcessExecutor, ExitKind},
+    executors::{ExitKind, InProcessExecutor},
     feedbacks::{CrashFeedback, MaxMapFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     generators::RandPrintablesGenerator,
     inputs::{BytesInput, HasTargetBytes},
-    mutators::scheduled::{havoc_mutations, StdScheduledMutator},
+    mutators::{havoc_mutations::havoc_mutations, scheduled::StdScheduledMutator},
     observers::StdMapObserver,
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
     state::StdState,
 };
-use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, AsSlice};
+use libafl_bolts::{current_nanos, nonzero, rands::StdRand, tuples::tuple_list, AsSlice};
 
 /// Coverage map with explicit assignments due to the lack of instrumentation
 static mut SIGNALS: [u8; 16] = [0; 16];
+// TODO: This will break soon, fix me! See https://github.com/AFLplusplus/LibAFL/issues/2786
+#[allow(static_mut_refs)] // only a problem in nightly
 static mut SIGNALS_PTR: *mut u8 = unsafe { SIGNALS.as_mut_ptr() };
 
 /// Assign a signal to the signals map
@@ -31,7 +33,7 @@ fn signals_set(idx: usize) {
     unsafe { write(SIGNALS_PTR.add(idx), 1) };
 }
 
-#[allow(clippy::similar_names, clippy::manual_assert)]
+#[expect(clippy::manual_assert)]
 pub fn main() {
     // The closure that we want to fuzz
     let mut harness = |input: &BytesInput| {
@@ -61,6 +63,8 @@ pub fn main() {
     };
 
     // Create an observation channel using the signals map
+    // TODO: This will break soon, fix me! See https://github.com/AFLplusplus/LibAFL/issues/2786
+    #[allow(static_mut_refs)] // only a problem in nightly
     let observer = unsafe { StdMapObserver::from_mut_ptr("signals", SIGNALS_PTR, SIGNALS.len()) };
 
     // Feedback to rate the interestingness of an input
@@ -116,7 +120,7 @@ pub fn main() {
     .expect("Failed to create the Executor");
 
     // Generator of printable bytearrays of max size 32
-    let mut generator = RandPrintablesGenerator::new(32);
+    let mut generator = RandPrintablesGenerator::new(nonzero!(32));
 
     // Generate 8 initial inputs
     state

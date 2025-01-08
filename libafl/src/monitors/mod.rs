@@ -174,7 +174,7 @@ impl UserStatsValue {
     }
 
     /// Divide by the number of elements
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     pub fn stats_div(&mut self, divisor: usize) -> Option<Self> {
         match self {
             Self::Number(x) => Some(Self::Float(*x as f64 / divisor as f64)),
@@ -186,7 +186,7 @@ impl UserStatsValue {
     }
 
     /// min user stats with the other
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     pub fn stats_max(&mut self, other: &Self) -> Option<Self> {
         match (self, other) {
             (Self::Number(x), Self::Number(y)) => {
@@ -224,7 +224,7 @@ impl UserStatsValue {
     }
 
     /// min user stats with the other
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     pub fn stats_min(&mut self, other: &Self) -> Option<Self> {
         match (self, other) {
             (Self::Number(x), Self::Number(y)) => {
@@ -262,7 +262,7 @@ impl UserStatsValue {
     }
 
     /// add user stats with the other
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     pub fn stats_add(&mut self, other: &Self) -> Option<Self> {
         match (self, other) {
             (Self::Number(x), Self::Number(y)) => Some(Self::Number(*x + *y)),
@@ -318,8 +318,11 @@ fn prettify_float(value: f64) -> String {
         value => (value, ""),
     };
     match value {
+        value if value >= 1000000.0 => {
+            format!("{value:.2}{suffix}")
+        }
         value if value >= 1000.0 => {
-            format!("{value}{suffix}")
+            format!("{value:.1}{suffix}")
         }
         value if value >= 100.0 => {
             format!("{value:.1}{suffix}")
@@ -369,7 +372,7 @@ pub struct ClientStats {
 }
 
 impl ClientStats {
-    /// We got a new information about executions for this client, insert them.
+    /// We got new information about executions for this client, insert them.
     #[cfg(feature = "afl_exec_sec")]
     pub fn update_executions(&mut self, executions: u64, cur_time: Duration) {
         let diff = cur_time
@@ -397,7 +400,7 @@ impl ClientStats {
         self.executions = self.prev_state_executions + executions;
     }
 
-    /// We got a new information about corpus size for this client, insert them.
+    /// We got new information about corpus size for this client, insert them.
     pub fn update_corpus_size(&mut self, corpus_size: u64) {
         self.corpus_size = corpus_size;
         self.last_corpus_time = current_time();
@@ -409,7 +412,7 @@ impl ClientStats {
     }
 
     /// Get the calculated executions per second for this client
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     #[cfg(feature = "afl_exec_sec")]
     pub fn execs_per_sec(&mut self, cur_time: Duration) -> f64 {
         if self.executions == 0 {
@@ -440,7 +443,7 @@ impl ClientStats {
     }
 
     /// Get the calculated executions per second for this client
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     #[cfg(not(feature = "afl_exec_sec"))]
     pub fn execs_per_sec(&mut self, cur_time: Duration) -> f64 {
         if self.executions == 0 {
@@ -532,7 +535,6 @@ pub trait Monitor {
     }
 
     /// Executions per second
-    #[allow(clippy::cast_sign_loss)]
     #[inline]
     fn execs_per_sec(&mut self) -> f64 {
         let cur_time = current_time();
@@ -1231,7 +1233,7 @@ impl ClientPerfMonitor {
 
 #[cfg(feature = "introspection")]
 impl fmt::Display for ClientPerfMonitor {
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         // Calculate the elapsed time from the monitor
         let elapsed: f64 = self.elapsed_cycles() as f64;

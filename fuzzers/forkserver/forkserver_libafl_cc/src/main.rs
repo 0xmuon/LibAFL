@@ -11,7 +11,7 @@ use libafl::{
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::BytesInput,
     monitors::SimpleMonitor,
-    mutators::{scheduled::havoc_mutations, tokens_mutations, StdScheduledMutator, Tokens},
+    mutators::{havoc_mutations, tokens_mutations, StdScheduledMutator, Tokens},
     observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::mutational::StdMutationalStage,
@@ -21,10 +21,10 @@ use libafl::{
 use libafl_bolts::{
     rands::StdRand,
     shmem::{ShMem, ShMemProvider, UnixShMemProvider},
-    tuples::{tuple_list, Handled, MatchNameRef, Merge},
+    tuples::{tuple_list, Handled, Merge},
     AsSliceMut, Truncate,
 };
-use libafl_targets::EDGES_MAP_SIZE_IN_USE;
+use libafl_targets::EDGES_MAP_DEFAULT_SIZE;
 use nix::sys::signal::Signal;
 
 /// The commandline args this fuzzer accepts
@@ -83,11 +83,10 @@ struct Opt {
     signal: Signal,
 }
 
-#[allow(clippy::similar_names)]
 pub fn main() {
     env_logger::init();
 
-    const MAP_SIZE: usize = EDGES_MAP_SIZE_IN_USE; //65536;
+    const MAP_SIZE: usize = EDGES_MAP_DEFAULT_SIZE; //65536;
     let opt = Opt::parse();
 
     let corpus_dirs: Vec<PathBuf> = [opt.in_dir].to_vec();

@@ -12,7 +12,8 @@ use libafl::{
     generators::RandBytesGenerator,
     monitors::MultiMonitor,
     mutators::{
-        scheduled::{havoc_mutations, tokens_mutations, StdScheduledMutator},
+        havoc_mutations::havoc_mutations,
+        scheduled::{tokens_mutations, StdScheduledMutator},
         token_mutations::Tokens,
     },
     observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
@@ -23,6 +24,7 @@ use libafl::{
 };
 use libafl_bolts::{
     core_affinity::Cores,
+    nonzero,
     rands::StdRand,
     shmem::{ShMem, ShMemProvider, UnixShMemProvider},
     tuples::{tuple_list, Handled, Merge},
@@ -74,10 +76,9 @@ pub struct ForkserverBytesCoverageSugar<'a> {
     iterations: Option<u64>,
 }
 
-#[allow(clippy::similar_names)]
-impl<'a> ForkserverBytesCoverageSugar<'a> {
+impl ForkserverBytesCoverageSugar<'_> {
     /// Runs the fuzzer.
-    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    #[expect(clippy::too_many_lines)]
     pub fn run(&mut self) {
         // a large initial map size that should be enough
         // to house all potential coverage maps for our targets
@@ -212,7 +213,7 @@ impl<'a> ForkserverBytesCoverageSugar<'a> {
             if state.must_load_initial_inputs() {
                 if self.input_dirs.is_empty() {
                     // Generator of printable bytearrays of max size 32
-                    let mut generator = RandBytesGenerator::new(32);
+                    let mut generator = RandBytesGenerator::new(nonzero!(32));
 
                     // Generate 8 initial inputs
                     state
@@ -334,7 +335,7 @@ pub mod pybind {
     impl ForkserverBytesCoverageSugar {
         /// Create a new [`ForkserverBytesCoverageSugar`]
         #[new]
-        #[allow(clippy::too_many_arguments)]
+        #[expect(clippy::too_many_arguments)]
         #[pyo3(signature = (
             input_dirs,
             output_dir,
@@ -368,7 +369,7 @@ pub mod pybind {
         }
 
         /// Run the fuzzer
-        #[allow(clippy::needless_pass_by_value)]
+        #[expect(clippy::needless_pass_by_value)]
         pub fn run(&self, program: String, arguments: Vec<String>) {
             forkserver::ForkserverBytesCoverageSugar::builder()
                 .input_dirs(&self.input_dirs)

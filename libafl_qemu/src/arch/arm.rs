@@ -51,7 +51,7 @@ pub fn get_exit_arch_regs() -> &'static EnumMap<ExitArgs, Regs> {
 }
 
 /// alias registers
-#[allow(non_upper_case_globals)]
+#[expect(non_upper_case_globals)]
 impl Regs {
     pub const Sp: Regs = Regs::R13;
     pub const Lr: Regs = Regs::R14;
@@ -61,14 +61,6 @@ impl Regs {
     pub const Fp: Regs = Regs::R11;
     pub const Ip: Regs = Regs::R12;
     pub const Cpsr: Regs = Regs::R25;
-}
-
-#[cfg(feature = "python")]
-impl IntoPy<PyObject> for Regs {
-    fn into_py(self, py: Python) -> PyObject {
-        let n: i32 = self.into();
-        n.into_py(py)
-    }
 }
 
 /// Return an ARM ArchCapstoneBuilder
@@ -88,10 +80,7 @@ pub fn capstone_thumb() -> capstone::arch::arm::ArchCapstoneBuilder {
 pub type GuestReg = u32;
 
 impl crate::ArchExtras for crate::CPU {
-    fn read_return_address<T>(&self) -> Result<T, QemuRWError>
-    where
-        T: From<GuestReg>,
-    {
+    fn read_return_address(&self) -> Result<GuestReg, QemuRWError> {
         self.read_reg(Regs::Lr)
     }
 
@@ -102,10 +91,11 @@ impl crate::ArchExtras for crate::CPU {
         self.write_reg(Regs::Lr, val)
     }
 
-    fn read_function_argument<T>(&self, conv: CallingConvention, idx: u8) -> Result<T, QemuRWError>
-    where
-        T: From<GuestReg>,
-    {
+    fn read_function_argument(
+        &self,
+        conv: CallingConvention,
+        idx: u8,
+    ) -> Result<GuestReg, QemuRWError> {
         QemuRWError::check_conv(QemuRWErrorKind::Read, CallingConvention::Cdecl, conv)?;
 
         let reg_id = match idx {

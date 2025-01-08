@@ -16,6 +16,7 @@ use libafl::{
     observers::{cmp::AFLppCmpLogHeader, CmpMap, CmpValues, CmplogBytes},
     Error,
 };
+use libafl_bolts::HasLen;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub use stages::*;
 
@@ -62,6 +63,7 @@ pub use libafl_cmplog_map_ptr as CMPLOG_MAP_PTR;
 
 /// Value indicating if cmplog is enabled.
 #[no_mangle]
+#[allow(non_upper_case_globals)] // expect breaks here for some reason
 pub static mut libafl_cmplog_enabled: u8 = 0;
 
 pub use libafl_cmplog_enabled as CMPLOG_ENABLED;
@@ -260,7 +262,7 @@ impl AFLppCmpLogFnOperands {
 /// The operands logged during `CmpLog`.
 #[repr(C)]
 #[derive(Default, Debug, Clone, Copy)]
-pub struct CmpLogInstruction(u64, u64);
+pub struct CmpLogInstruction(u64, u64, u8);
 
 /// The routine arguments logged during `CmpLog`.
 #[repr(C)]
@@ -371,18 +373,22 @@ impl CmpMap for CmpLogMap {
                     1 => Some(CmpValues::U8((
                         self.vals.operands[idx][execution].0 as u8,
                         self.vals.operands[idx][execution].1 as u8,
+                        self.vals.operands[idx][execution].2 == 1,
                     ))),
                     2 => Some(CmpValues::U16((
                         self.vals.operands[idx][execution].0 as u16,
                         self.vals.operands[idx][execution].1 as u16,
+                        self.vals.operands[idx][execution].2 == 1,
                     ))),
                     4 => Some(CmpValues::U32((
                         self.vals.operands[idx][execution].0 as u32,
                         self.vals.operands[idx][execution].1 as u32,
+                        self.vals.operands[idx][execution].2 == 1,
                     ))),
                     8 => Some(CmpValues::U64((
                         self.vals.operands[idx][execution].0,
                         self.vals.operands[idx][execution].1,
+                        self.vals.operands[idx][execution].2 == 1,
                     ))),
                     // other => panic!("Invalid CmpLog shape {}", other),
                     _ => None,
@@ -418,7 +424,7 @@ impl CmpMap for CmpLogMap {
 
 /// The global `CmpLog` map for the current `LibAFL` run.
 #[no_mangle]
-#[allow(clippy::large_stack_arrays)]
+#[allow(non_upper_case_globals)] // expect breaks here for some reason
 pub static mut libafl_cmplog_map: CmpLogMap = CmpLogMap {
     headers: [CmpLogHeader {
         hits: 0,
@@ -426,16 +432,15 @@ pub static mut libafl_cmplog_map: CmpLogMap = CmpLogMap {
         kind: 0,
     }; CMPLOG_MAP_W],
     vals: CmpLogVals {
-        operands: [[CmpLogInstruction(0, 0); CMPLOG_MAP_H]; CMPLOG_MAP_W],
+        operands: [[CmpLogInstruction(0, 0, 0); CMPLOG_MAP_H]; CMPLOG_MAP_W],
     },
 };
 
 /// The globale `CmpLog` map, aflpp style
 #[no_mangle]
 #[cfg(feature = "cmplog_extended_instrumentation")]
-#[allow(clippy::large_stack_arrays)]
 pub static mut libafl_cmplog_map_extended: AFLppCmpLogMap = AFLppCmpLogMap {
-    headers: [AFLppCmpLogHeader { data: [0; 2] }; CMPLOG_MAP_W],
+    headers: [AFLppCmpLogHeader::new_with_raw_value(0); CMPLOG_MAP_W],
     vals: AFLppCmpLogVals {
         operands: [[AFLppCmpLogOperands {
             v0: 0,
@@ -456,15 +461,22 @@ pub use libafl_cmplog_map as CMPLOG_MAP;
 pub use libafl_cmplog_map_extended as CMPLOG_MAP_EXTENDED;
 
 #[derive(Debug, Clone)]
-#[repr(C, packed)]
+#[repr(C)]
 /// Comparison map compatible with AFL++ cmplog instrumentation
 pub struct AFLppCmpLogMap {
     headers: [AFLppCmpLogHeader; CMPLOG_MAP_W],
     vals: AFLppCmpLogVals,
 }
 
+impl HasLen for AFLppCmpLogMap {
+    fn len(&self) -> usize {
+        CMPLOG_MAP_W
+    }
+}
+
 impl AFLppCmpLogMap {
     #[must_use]
+    #[expect(clippy::cast_ptr_alignment)]
     /// Instantiate a new boxed zeroed `AFLppCmpLogMap`. This should be used to create a new
     /// map, because it is so large it cannot be allocated on the stack with default
     /// runtime configuration.
@@ -511,6 +523,7 @@ impl Serialize for AFLppCmpLogMap {
 }
 
 impl<'de> Deserialize<'de> for AFLppCmpLogMap {
+    #[expect(clippy::cast_ptr_alignment)]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -527,11 +540,11 @@ impl CmpMap for AFLppCmpLogMap {
     }
 
     fn executions_for(&self, idx: usize) -> usize {
-        self.headers[idx].hits() as usize
+        self.headers[idx].hits().value() as usize
     }
 
     fn usable_executions_for(&self, idx: usize) -> usize {
-        if self.headers[idx]._type() == CMPLOG_KIND_INS {
+        if self.headers[idx].type_().value() == CMPLOG_KIND_INS {
             if self.executions_for(idx) < CMPLOG_MAP_H {
                 self.executions_for(idx)
             } else {
@@ -545,24 +558,29 @@ impl CmpMap for AFLppCmpLogMap {
     }
 
     fn values_of(&self, idx: usize, execution: usize) -> Option<CmpValues> {
-        if self.headers[idx]._type() == CMPLOG_KIND_INS {
+        let header = self.headers[idx];
+        if header.type_().value() == CMPLOG_KIND_INS {
             unsafe {
-                match self.headers[idx].shape() {
+                match self.headers[idx].shape().value() {
                     0 => Some(CmpValues::U8((
                         self.vals.operands[idx][execution].v0 as u8,
                         self.vals.operands[idx][execution].v1 as u8,
+                        false,
                     ))),
                     1 => Some(CmpValues::U16((
                         self.vals.operands[idx][execution].v0 as u16,
                         self.vals.operands[idx][execution].v1 as u16,
+                        false,
                     ))),
                     3 => Some(CmpValues::U32((
                         self.vals.operands[idx][execution].v0 as u32,
                         self.vals.operands[idx][execution].v1 as u32,
+                        false,
                     ))),
                     7 => Some(CmpValues::U64((
                         self.vals.operands[idx][execution].v0,
                         self.vals.operands[idx][execution].v1,
+                        false,
                     ))),
                     // TODO handle 128 bits & 256 bits cmps
                     // other => panic!("Invalid CmpLog shape {}", other),
@@ -583,7 +601,7 @@ impl CmpMap for AFLppCmpLogMap {
 
     fn reset(&mut self) -> Result<(), Error> {
         // For performance, we reset just the headers
-        self.headers.fill(AFLppCmpLogHeader { data: [0; 2] });
+        self.headers.fill(AFLppCmpLogHeader::new_with_raw_value(0));
 
         Ok(())
     }

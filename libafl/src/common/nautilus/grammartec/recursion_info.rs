@@ -2,7 +2,10 @@ use alloc::vec::Vec;
 use std::fmt;
 
 use hashbrown::HashMap;
-use libafl_bolts::rands::{loaded_dice::LoadedDiceSampler, Rand};
+use libafl_bolts::{
+    rands::{loaded_dice::LoadedDiceSampler, Rand},
+    Error,
+};
 
 use crate::common::nautilus::grammartec::{
     context::Context,
@@ -32,7 +35,8 @@ impl RecursionInfo {
     pub fn new(t: &Tree, n: NTermId, ctx: &Context) -> Option<Self> {
         let (recursive_parents, node_by_offset, depth_by_offset) =
             RecursionInfo::find_parents(t, n, ctx)?;
-        let sampler = RecursionInfo::build_sampler(&depth_by_offset);
+        let sampler = RecursionInfo::build_sampler(&depth_by_offset)
+            .expect("Sampler depth_by_offset invalid");
         Some(Self {
             recursive_parents,
             sampler,
@@ -49,7 +53,7 @@ impl RecursionInfo {
     // different recursions. Therefore we use the weight of the node to sample the endpoint of a path trough the
     // recursion tree. Then we just sample the length of this path uniformly as `(1.. weight)`. This
     // yields a uniform sample from the whole set of recursions inside the tree. If you read this, Good luck you are on your own.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn find_parents(
         t: &Tree,
         nt: NTermId,
@@ -78,8 +82,8 @@ impl RecursionInfo {
         res
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    fn build_sampler(depths: &[usize]) -> LoadedDiceSampler {
+    #[expect(clippy::cast_precision_loss)]
+    fn build_sampler(depths: &[usize]) -> Result<LoadedDiceSampler, Error> {
         let mut weights = depths.iter().map(|x| *x as f64).collect::<Vec<_>>();
         let norm: f64 = weights.iter().sum();
         assert!(norm > 0.0);

@@ -4,78 +4,49 @@ Welcome to `LibAFL`
 #![doc = include_str!("../README.md")]
 /*! */
 #![cfg_attr(feature = "document-features", doc = document_features::document_features!())]
-#![forbid(unexpected_cfgs)]
-#![allow(incomplete_features)]
 #![no_std]
 // For `type_eq`
 #![cfg_attr(nightly, feature(specialization))]
 // For `std::simd`
 #![cfg_attr(nightly, feature(portable_simd))]
-#![warn(clippy::cargo)]
-#![allow(ambiguous_glob_reexports)]
-#![deny(clippy::cargo_common_metadata)]
-#![deny(rustdoc::broken_intra_doc_links)]
-#![deny(clippy::all)]
-#![deny(clippy::pedantic)]
-#![allow(
-    clippy::unreadable_literal,
-    clippy::type_repetition_in_bounds,
-    clippy::missing_errors_doc,
-    clippy::cast_possible_truncation,
-    clippy::used_underscore_binding,
-    clippy::ptr_as_ptr,
-    clippy::missing_panics_doc,
-    clippy::missing_docs_in_private_items,
-    clippy::module_name_repetitions,
-    clippy::ptr_cast_constness,
-    clippy::unsafe_derive_deserialize,
-    clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::into_iter_without_iter, // broken
+#![cfg_attr(
+    not(test),
+    warn(
+        missing_debug_implementations,
+        missing_docs,
+        trivial_numeric_casts,
+        unused_extern_crates,
+        unused_import_braces,
+        unused_qualifications,
+    )
 )]
-#![cfg_attr(not(test), warn(
-    missing_debug_implementations,
-    missing_docs,
-    //trivial_casts,
-    trivial_numeric_casts,
-    unused_extern_crates,
-    unused_import_braces,
-    unused_qualifications,
-    //unused_results
-))]
-#![cfg_attr(test, deny(
-    missing_debug_implementations,
-    missing_docs,
-    //trivial_casts,
-    trivial_numeric_casts,
-    unused_extern_crates,
-    unused_import_braces,
-    unused_qualifications,
-    unused_must_use,
-    //unused_results
-))]
 #![cfg_attr(
     test,
     deny(
         bad_style,
         dead_code,
         improper_ctypes,
-        non_shorthand_field_patterns,
+        missing_debug_implementations,
+        missing_docs,
         no_mangle_generic_items,
+        non_shorthand_field_patterns,
         overflowing_literals,
         path_statements,
         patterns_in_fns_without_body,
+        trivial_numeric_casts,
         unconditional_recursion,
-        unused,
+        unfulfilled_lint_expectations,
         unused_allocation,
         unused_comparisons,
+        unused_extern_crates,
+        unused_import_braces,
+        unused_must_use,
         unused_parens,
+        unused_qualifications,
+        unused,
         while_true
     )
 )]
-// Till they fix this buggy lint in clippy
-#![allow(clippy::borrow_as_ptr)]
-#![allow(clippy::borrow_deref_ref)]
 
 #[cfg(feature = "std")]
 #[macro_use]
@@ -86,7 +57,7 @@ pub extern crate alloc;
 
 // Re-export derive(SerdeAny)
 #[cfg(feature = "derive")]
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 #[macro_use]
 extern crate libafl_derive;
 #[cfg(feature = "derive")]
@@ -110,7 +81,7 @@ pub mod stages;
 pub mod state;
 
 pub use fuzzer::*;
-pub use libafl_bolts::Error;
+pub use libafl_bolts::{nonzero, Error};
 
 /// The purpose of this module is to alleviate imports of many components by adding a glob import.
 #[cfg(feature = "prelude")]
@@ -135,7 +106,10 @@ mod tests {
 
     #[cfg(miri)]
     use libafl_bolts::serdeany::RegistryBuilder;
-    use libafl_bolts::{rands::StdRand, tuples::tuple_list};
+    use libafl_bolts::{
+        rands::{RomuDuoJrRand, StdRand},
+        tuples::tuple_list,
+    };
 
     #[cfg(miri)]
     use crate::stages::ExecutionCountRestartHelperMetadata;
@@ -155,7 +129,6 @@ mod tests {
     };
 
     #[test]
-    #[allow(clippy::similar_names)]
     fn test_fuzzer() {
         // # Safety
         // No concurrency per testcase
@@ -221,7 +194,15 @@ mod tests {
             InMemoryCorpus<BytesInput>,
             StdRand,
             InMemoryCorpus<BytesInput>,
-        > = postcard::from_bytes(state_serialized.as_slice()).unwrap();
+        > = postcard::from_bytes::<
+            StdState<
+                BytesInput,
+                InMemoryCorpus<BytesInput>,
+                RomuDuoJrRand,
+                InMemoryCorpus<BytesInput>,
+            >,
+        >(state_serialized.as_slice())
+        .unwrap();
         assert_eq!(state.corpus().count(), state_deserialized.corpus().count());
 
         let corpus_serialized = postcard::to_allocvec(state.corpus()).unwrap();

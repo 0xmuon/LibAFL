@@ -1,3 +1,4 @@
+#![allow(clippy::needless_pass_by_value)] // default compiler complains about Option<&mut T> otherwise, and this is used extensively.
 use std::{cell::UnsafeCell, mem::MaybeUninit, sync::Mutex};
 
 use hashbrown::{HashMap, HashSet};
@@ -8,30 +9,36 @@ use thread_local::ThreadLocal;
 
 #[cfg(any(cpu_target = "arm", cpu_target = "i386", cpu_target = "mips"))]
 use crate::SYS_fstatat64;
-#[cfg(not(cpu_target = "arm"))]
+#[cfg(not(any(cpu_target = "arm", cpu_target = "riscv32")))]
 use crate::SYS_mmap;
-#[cfg(any(cpu_target = "arm", cpu_target = "mips"))]
+#[cfg(any(cpu_target = "arm", cpu_target = "mips", cpu_target = "riscv32"))]
 use crate::SYS_mmap2;
 #[cfg(not(any(
     cpu_target = "arm",
     cpu_target = "mips",
     cpu_target = "i386",
-    cpu_target = "ppc"
+    cpu_target = "ppc",
+    cpu_target = "riscv32",
 )))]
 use crate::SYS_newfstatat;
 use crate::{
     emu::EmulatorModules,
-    modules::{asan::AsanModule, EmulatorModule, EmulatorModuleTuple, Range},
+    modules::{
+        asan::AsanModule,
+        utils::filters::{NopAddressFilter, NOP_ADDRESS_FILTER},
+        EmulatorModule, EmulatorModuleTuple, Range,
+    },
     qemu::{Hook, SyscallHookResult},
-    Qemu, SYS_brk, SYS_fstat, SYS_fstatfs, SYS_futex, SYS_getrandom, SYS_mprotect, SYS_mremap,
-    SYS_munmap, SYS_pread64, SYS_read, SYS_readlinkat, SYS_statfs,
+    Qemu, SYS_brk, SYS_mprotect, SYS_mremap, SYS_munmap, SYS_pread64, SYS_read, SYS_readlinkat,
 };
+#[cfg(not(cpu_target = "riscv32"))]
+use crate::{SYS_fstat, SYS_fstatfs, SYS_futex, SYS_getrandom, SYS_statfs};
 
 // TODO use the functions provided by Qemu
 pub const SNAPSHOT_PAGE_SIZE: usize = 4096;
 pub const SNAPSHOT_PAGE_MASK: GuestAddr = !(SNAPSHOT_PAGE_SIZE as GuestAddr - 1);
 
-pub type StopExecutionCallback = Box<dyn FnMut(&mut SnapshotModule, &Qemu)>;
+pub type StopExecutionCallback = Box<dyn FnMut(&mut SnapshotModule, Qemu)>;
 
 #[derive(Clone, Debug)]
 pub struct SnapshotPageInfo {
@@ -84,6 +91,7 @@ pub struct SnapshotModule {
     pub maps: MappingInfo,
     pub new_maps: Mutex<MappingInfo>,
     pub pages: HashMap<GuestAddr, SnapshotPageInfo>,
+    pub initial_brk: GuestAddr,
     pub brk: GuestAddr,
     pub mmap_start: GuestAddr,
     pub mmap_limit: usize,
@@ -115,6 +123,7 @@ impl SnapshotModule {
             maps: MappingInfo::default(),
             new_maps: Mutex::new(MappingInfo::default()),
             pages: HashMap::default(),
+            initial_brk: 0,
             brk: 0,
             mmap_start: 0,
             mmap_limit: 0,
@@ -132,6 +141,7 @@ impl SnapshotModule {
             maps: MappingInfo::default(),
             new_maps: Mutex::new(MappingInfo::default()),
             pages: HashMap::default(),
+            initial_brk: 0,
             brk: 0,
             mmap_start: 0,
             mmap_limit: 0,
@@ -149,6 +159,7 @@ impl SnapshotModule {
             maps: MappingInfo::default(),
             new_maps: Mutex::new(MappingInfo::default()),
             pages: HashMap::default(),
+            initial_brk: 0,
             brk: 0,
             mmap_start: 0,
             mmap_limit,
@@ -182,10 +193,10 @@ impl SnapshotModule {
         false
     }
 
-    #[allow(clippy::uninit_assumed_init)]
     pub fn snapshot(&mut self, qemu: Qemu) {
         log::info!("Start snapshot");
         self.brk = qemu.get_brk();
+        self.initial_brk = qemu.get_initial_brk();
         self.mmap_start = qemu.get_mmap_start();
         self.pages.clear();
         for map in qemu.mappings() {
@@ -205,7 +216,7 @@ impl SnapshotModule {
                     // TODO not just for R pages
                     unsafe {
                         info.data = Some(Box::new(core::mem::zeroed()));
-                        qemu.read_mem(addr, &mut info.data.as_mut().unwrap()[..]);
+                        qemu.read_mem_unchecked(addr, &mut info.data.as_mut().unwrap()[..]);
                     }
                 }
                 self.pages.insert(addr, info);
@@ -252,7 +263,7 @@ impl SnapshotModule {
 
     pub fn access(&mut self, addr: GuestAddr, size: usize) {
         // ASSUMPTION: the access can only cross 2 pages
-        debug_assert!(size > 0 && size < SNAPSHOT_PAGE_SIZE);
+        debug_assert!(size > 0 && size <= SNAPSHOT_PAGE_SIZE);
         let page = addr & SNAPSHOT_PAGE_MASK;
         self.page_access(page);
         let second_page = (addr + size as GuestAddr - 1) & SNAPSHOT_PAGE_MASK;
@@ -296,7 +307,8 @@ impl SnapshotModule {
                             qemu.read_mem(
                                 addr,
                                 current_page_content.as_mut_ptr().as_mut().unwrap(),
-                            );
+                            )
+                            .unwrap();
                         }
 
                         let current_page_content: &mut [u8; SNAPSHOT_PAGE_SIZE] =
@@ -408,7 +420,7 @@ impl SnapshotModule {
                                 return true; // Restore later
                             }
 
-                            unsafe { qemu.write_mem(*page, &data[..]) };
+                            unsafe { qemu.write_mem_unchecked(*page, &data[..]) };
                         } else {
                             panic!("Cannot restored a dirty but unsaved page");
                         }
@@ -443,7 +455,7 @@ impl SnapshotModule {
                 if let Some(info) = self.pages.get_mut(page) {
                     // TODO avoid duplicated memcpy
                     if let Some(data) = info.data.as_ref() {
-                        unsafe { qemu.write_mem(*page, &data[..]) };
+                        unsafe { qemu.write_mem_unchecked(*page, &data[..]) };
                     } else {
                         panic!("Cannot restored a dirty but unsaved page");
                     }
@@ -507,7 +519,7 @@ impl SnapshotModule {
         if self.mmap_limit != 0 && total_size > self.mmap_limit {
             let mut cb = self.stop_execution.take().unwrap();
             let qemu = Qemu::get().unwrap();
-            cb(self, &qemu);
+            cb(self, qemu);
             self.stop_execution = Some(cb);
         }
     }
@@ -667,7 +679,9 @@ impl<S> EmulatorModule<S> for SnapshotModule
 where
     S: Unpin + UsesInput,
 {
-    fn init_module<ET>(&self, emulator_modules: &mut EmulatorModules<ET, S>)
+    type ModuleAddressFilter = NopAddressFilter;
+
+    fn post_qemu_init<ET>(&mut self, _qemu: Qemu, emulator_modules: &mut EmulatorModules<ET, S>)
     where
         ET: EmulatorModuleTuple<S>,
     {
@@ -684,24 +698,38 @@ where
         }
 
         if !self.accurate_unmap {
-            emulator_modules.syscalls(Hook::Function(filter_mmap_snapshot::<ET, S>));
+            emulator_modules.pre_syscalls(Hook::Function(filter_mmap_snapshot::<ET, S>));
         }
-        emulator_modules.after_syscalls(Hook::Function(trace_mmap_snapshot::<ET, S>));
+        emulator_modules.post_syscalls(Hook::Function(trace_mmap_snapshot::<ET, S>));
     }
 
-    fn pre_exec<ET>(&mut self, emulator_modules: &mut EmulatorModules<ET, S>, _input: &S::Input)
-    where
+    fn pre_exec<ET>(
+        &mut self,
+        qemu: Qemu,
+        _emulator_modules: &mut EmulatorModules<ET, S>,
+        _state: &mut S,
+        _input: &S::Input,
+    ) where
         ET: EmulatorModuleTuple<S>,
     {
         if self.empty {
-            self.snapshot(emulator_modules.qemu());
+            self.snapshot(qemu);
         } else {
-            self.reset(emulator_modules.qemu());
+            self.reset(qemu);
         }
+    }
+
+    fn address_filter(&self) -> &Self::ModuleAddressFilter {
+        &NopAddressFilter
+    }
+
+    fn address_filter_mut(&mut self) -> &mut Self::ModuleAddressFilter {
+        unsafe { (&raw mut NOP_ADDRESS_FILTER).as_mut().unwrap().get_mut() }
     }
 }
 
 pub fn trace_write_snapshot<ET, S, const SIZE: usize>(
+    _qemu: Qemu,
     emulator_modules: &mut EmulatorModules<ET, S>,
     _state: Option<&mut S>,
     _id: u64,
@@ -715,6 +743,7 @@ pub fn trace_write_snapshot<ET, S, const SIZE: usize>(
 }
 
 pub fn trace_write_n_snapshot<ET, S>(
+    _qemu: Qemu,
     emulator_modules: &mut EmulatorModules<ET, S>,
     _state: Option<&mut S>,
     _id: u64,
@@ -728,9 +757,9 @@ pub fn trace_write_n_snapshot<ET, S>(
     h.access(addr, size);
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(non_upper_case_globals)]
+#[expect(clippy::too_many_arguments)]
 pub fn filter_mmap_snapshot<ET, S>(
+    _qemu: Qemu,
     emulator_modules: &mut EmulatorModules<ET, S>,
     _state: Option<&mut S>,
     sys_num: i32,
@@ -756,9 +785,9 @@ where
     SyscallHookResult::new(None)
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-#[allow(non_upper_case_globals)]
+#[expect(non_upper_case_globals, clippy::too_many_arguments)]
 pub fn trace_mmap_snapshot<ET, S>(
+    _qemu: Qemu,
     emulator_modules: &mut EmulatorModules<ET, S>,
     _state: Option<&mut S>,
     result: GuestAddr,
@@ -786,6 +815,7 @@ where
             let h = emulator_modules.get_mut::<SnapshotModule>().unwrap();
             h.access(a2, a3 as usize);
         }
+        #[cfg(not(cpu_target = "riscv32"))]
         SYS_futex => {
             let h = emulator_modules.get_mut::<SnapshotModule>().unwrap();
             h.access(a0, a3 as usize);
@@ -794,7 +824,8 @@ where
             cpu_target = "arm",
             cpu_target = "i386",
             cpu_target = "mips",
-            cpu_target = "ppc"
+            cpu_target = "ppc",
+            cpu_target = "riscv32"
         )))]
         SYS_newfstatat => {
             if a2 != 0 {
@@ -809,22 +840,28 @@ where
                 h.access(a2, 4096); // stat is not greater than a page
             }
         }
-        SYS_statfs | SYS_fstatfs | SYS_fstat => {
+        #[cfg(not(cpu_target = "riscv32"))]
+        SYS_statfs | SYS_fstat | SYS_fstatfs => {
             let h = emulator_modules.get_mut::<SnapshotModule>().unwrap();
             h.access(a1, 4096); // stat is not greater than a page
         }
+        #[cfg(not(cpu_target = "riscv32"))]
         SYS_getrandom => {
             let h = emulator_modules.get_mut::<SnapshotModule>().unwrap();
             h.access(a0, a1 as usize);
         }
         SYS_brk => {
             let h = emulator_modules.get_mut::<SnapshotModule>().unwrap();
-            if h.brk != result && result != 0 {
-                /* brk has changed. we change mapping from the snapshotted brk address to the new target_brk
+            if h.brk != result && result != 0 && result > h.initial_brk {
+                /* brk has changed, and it doesn't shrink below initial_brk. We change mapping from the snapshotted initial brk address to the new target_brk
                  * If no brk mapping has been made until now, change_mapped won't change anything and just create a new mapping.
                  * It is safe to assume RW perms here
                  */
-                h.change_mapped(h.brk, (result - h.brk) as usize, Some(MmapPerms::ReadWrite));
+                h.change_mapped(
+                    h.initial_brk,
+                    (result - h.initial_brk) as usize,
+                    Some(MmapPerms::ReadWrite),
+                );
             }
         }
         // mmap syscalls
@@ -837,7 +874,7 @@ where
 
             // TODO handle huge pages
 
-            #[cfg(any(cpu_target = "arm", cpu_target = "mips"))]
+            #[cfg(any(cpu_target = "arm", cpu_target = "mips", cpu_target = "riscv32"))]
             if sys_const == SYS_mmap2 {
                 if let Ok(prot) = MmapPerms::try_from(a2 as i32) {
                     let h = emulator_modules.get_mut::<SnapshotModule>().unwrap();
@@ -845,7 +882,7 @@ where
                 }
             }
 
-            #[cfg(not(cpu_target = "arm"))]
+            #[cfg(not(any(cpu_target = "arm", cpu_target = "riscv32")))]
             if sys_const == SYS_mmap {
                 if let Ok(prot) = MmapPerms::try_from(a2 as i32) {
                     let h = emulator_modules.get_mut::<SnapshotModule>().unwrap();

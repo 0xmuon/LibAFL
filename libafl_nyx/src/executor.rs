@@ -5,9 +5,9 @@ use std::{
 };
 
 use libafl::{
-    executors::{Executor, ExitKind, HasObservers},
+    executors::{Executor, ExitKind, HasObservers, HasTimeout},
     inputs::HasTargetBytes,
-    observers::{ObserversTuple, StdOutObserver, UsesObservers},
+    observers::{ObserversTuple, StdOutObserver},
     state::{HasExecutions, State, UsesState},
     Error,
 };
@@ -45,21 +45,12 @@ where
     type State = S;
 }
 
-impl<S, OT> UsesObservers for NyxExecutor<S, OT>
-where
-    OT: ObserversTuple<S>,
-    S: State,
-{
-    type Observers = OT;
-}
-
 impl<EM, S, Z, OT> Executor<EM, Z> for NyxExecutor<S, OT>
 where
     EM: UsesState<State = S>,
     S: State + HasExecutions,
     S::Input: HasTargetBytes,
-    Z: UsesState<State = S>,
-    OT: ObserversTuple<S>,
+    OT: ObserversTuple<S::Input, S>,
 {
     fn run_target(
         &mut self,
@@ -137,9 +128,34 @@ where
     }
 }
 
+impl<S, OT> HasTimeout for NyxExecutor<S, OT> {
+    fn timeout(&self) -> std::time::Duration {
+        self.helper.timeout
+    }
+
+    fn set_timeout(&mut self, timeout: std::time::Duration) {
+        let micros = 1000000;
+        let mut timeout_secs = timeout.as_secs();
+        let mut timeout_micros = timeout.as_micros() - u128::from(timeout.as_secs() * micros);
+        // since timeout secs is a u8 -> convert any overflow into micro secs
+        if timeout_secs > 255 {
+            timeout_micros = u128::from((timeout_secs - 255) * micros);
+            timeout_secs = 255;
+        }
+
+        self.helper.timeout = timeout;
+
+        self.helper
+            .set_timeout(timeout_secs as u8, timeout_micros as u32);
+    }
+}
+
 impl<S, OT> NyxExecutor<S, OT> {
-    /// convert `trace_bits` ptr into real trace map
-    pub fn trace_bits(self) -> &'static mut [u8] {
+    /// Convert `trace_bits` ptr into real trace map
+    ///
+    /// # Safety
+    /// Mutable borrow may only be used once at a time.
+    pub unsafe fn trace_bits(self) -> &'static mut [u8] {
         unsafe {
             std::slice::from_raw_parts_mut(self.helper.bitmap_buffer, self.helper.bitmap_size)
         }
@@ -192,8 +208,10 @@ impl NyxExecutorBuilder {
 impl<S, OT> HasObservers for NyxExecutor<S, OT>
 where
     S: State,
-    OT: ObserversTuple<S>,
+    OT: ObserversTuple<S::Input, S>,
 {
+    type Observers = OT;
+
     fn observers(&self) -> RefIndexable<&Self::Observers, Self::Observers> {
         RefIndexable::from(&self.observers)
     }

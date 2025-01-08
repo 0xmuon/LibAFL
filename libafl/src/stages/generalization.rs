@@ -11,6 +11,8 @@ use libafl_bolts::{
     AsSlice, Named,
 };
 
+#[cfg(feature = "introspection")]
+use crate::monitors::PerfFeature;
 use crate::{
     corpus::{Corpus, HasCurrentCorpusId},
     executors::{Executor, HasObservers},
@@ -21,11 +23,9 @@ use crate::{
     require_novelties_tracking,
     stages::{RetryCountRestartHelper, Stage},
     start_timer,
-    state::{HasCorpus, HasExecutions, UsesState},
+    state::{HasCorpus, HasExecutions, MaybeHasClientPerfMonitor, UsesState},
     Error, HasMetadata, HasNamedMetadata,
 };
-#[cfg(feature = "introspection")]
-use crate::{monitors::PerfFeature, state::HasClientPerfMonitor};
 
 const MAX_GENERALIZED_LEN: usize = 8192;
 
@@ -48,43 +48,41 @@ pub static GENERALIZATION_STAGE_NAME: &str = "generalization";
 
 /// A stage that runs a tracer executor
 #[derive(Clone, Debug)]
-pub struct GeneralizationStage<C, EM, O, OT, Z> {
+pub struct GeneralizationStage<C, EM, O, OT, S, Z> {
     name: Cow<'static, str>,
     map_observer_handle: Handle<C>,
-    #[allow(clippy::type_complexity)]
-    phantom: PhantomData<(EM, O, OT, Z)>,
+    phantom: PhantomData<(EM, O, OT, S, Z)>,
 }
 
-impl<C, EM, O, OT, Z> Named for GeneralizationStage<C, EM, O, OT, Z> {
+impl<C, EM, O, OT, S, Z> Named for GeneralizationStage<C, EM, O, OT, S, Z> {
     fn name(&self) -> &Cow<'static, str> {
         &self.name
     }
 }
 
-impl<C, EM, O, OT, Z> UsesState for GeneralizationStage<C, EM, O, OT, Z>
-where
-    EM: UsesState,
-{
-    type State = EM::State;
-}
-
-impl<C, E, EM, O, Z> Stage<E, EM, Z> for GeneralizationStage<C, EM, O, E::Observers, Z>
+impl<C, E, EM, O, S, Z> Stage<E, EM, S, Z> for GeneralizationStage<C, EM, O, E::Observers, S, Z>
 where
     O: MapObserver,
     C: CanTrack + AsRef<O> + Named,
-    E: Executor<EM, Z, State = Self::State> + HasObservers,
-    Self::State:
-        UsesInput<Input = BytesInput> + HasExecutions + HasMetadata + HasCorpus + HasNamedMetadata,
-    EM: UsesState,
-    Z: UsesState<State = Self::State>,
+    E: Executor<EM, Z, State = S> + HasObservers,
+    E::Observers: ObserversTuple<BytesInput, S>,
+    S: HasExecutions
+        + HasMetadata
+        + HasCorpus
+        + HasNamedMetadata
+        + HasCurrentCorpusId
+        + MaybeHasClientPerfMonitor
+        + UsesInput<Input = BytesInput>,
+    S::Corpus: Corpus<Input = BytesInput>,
+    EM: UsesState<State = S>,
 {
     #[inline]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn perform(
         &mut self,
         fuzzer: &mut Z,
         executor: &mut E,
-        state: &mut Self::State,
+        state: &mut S,
         manager: &mut EM,
     ) -> Result<(), Error> {
         let Some(corpus_id) = state.current_corpus_id()? else {
@@ -109,6 +107,11 @@ where
             let input = entry.input_mut().as_mut().unwrap();
 
             let payload: Vec<_> = input.bytes().iter().map(|&x| Some(x)).collect();
+
+            if payload.len() > MAX_GENERALIZED_LEN {
+                return Ok(());
+            }
+
             let original = input.clone();
             let meta = entry.metadata_map().get::<MapNoveltiesMetadata>().ok_or_else(|| {
                     Error::key_not_found(format!(
@@ -309,43 +312,44 @@ where
             b'"',
         )?;
 
-        if payload.len() <= MAX_GENERALIZED_LEN {
-            // Save the modified input in the corpus
-            {
-                let meta = GeneralizedInputMetadata::generalized_from_options(&payload);
+        // Save the modified input in the corpus
+        {
+            let meta = GeneralizedInputMetadata::generalized_from_options(&payload);
 
-                assert!(meta.generalized().first() == Some(&GeneralizedItem::Gap));
-                assert!(meta.generalized().last() == Some(&GeneralizedItem::Gap));
+            assert!(meta.generalized().first() == Some(&GeneralizedItem::Gap));
+            assert!(meta.generalized().last() == Some(&GeneralizedItem::Gap));
 
-                let mut entry = state.corpus().get(corpus_id)?.borrow_mut();
-                entry.metadata_map_mut().insert(meta);
-            }
+            let mut entry = state.corpus().get(corpus_id)?.borrow_mut();
+            entry.metadata_map_mut().insert(meta);
         }
 
         Ok(())
     }
 
     #[inline]
-    fn should_restart(&mut self, state: &mut Self::State) -> Result<bool, Error> {
+    fn should_restart(&mut self, state: &mut S) -> Result<bool, Error> {
         // TODO: We need to be able to resume better if something crashes or times out
         RetryCountRestartHelper::should_restart(state, &self.name, 3)
     }
 
     #[inline]
-    fn clear_progress(&mut self, state: &mut Self::State) -> Result<(), Error> {
+    fn clear_progress(&mut self, state: &mut S) -> Result<(), Error> {
         // TODO: We need to be able to resume better if something crashes or times out
         RetryCountRestartHelper::clear_progress(state, &self.name)
     }
 }
 
-impl<C, EM, O, OT, Z> GeneralizationStage<C, EM, O, OT, Z>
+impl<C, EM, O, OT, S, Z> GeneralizationStage<C, EM, O, OT, S, Z>
 where
-    EM: UsesState,
     O: MapObserver,
     C: CanTrack + AsRef<O> + Named,
-    OT: ObserversTuple<<Self as UsesState>::State>,
-    <Self as UsesState>::State:
-        UsesInput<Input = BytesInput> + HasExecutions + HasMetadata + HasCorpus,
+    S: HasExecutions
+        + HasMetadata
+        + HasCorpus
+        + MaybeHasClientPerfMonitor
+        + UsesInput<Input = BytesInput>,
+    OT: ObserversTuple<BytesInput, S>,
+    EM: UsesState<State = S>,
 {
     /// Create a new [`GeneralizationStage`].
     #[must_use]
@@ -365,14 +369,14 @@ where
         &self,
         fuzzer: &mut Z,
         executor: &mut E,
-        state: &mut <Self as UsesState>::State,
+        state: &mut S,
         manager: &mut EM,
         novelties: &[usize],
         input: &BytesInput,
     ) -> Result<bool, Error>
     where
-        E: Executor<EM, Z> + HasObservers<Observers = OT, State = <Self as UsesState>::State>,
-        Z: UsesState<State = <Self as UsesState>::State>,
+        E: Executor<EM, Z, State = S> + HasObservers,
+        E::Observers: ObserversTuple<BytesInput, S>,
     {
         start_timer!(state);
         executor.observers_mut().pre_exec_all(state, input)?;
@@ -400,12 +404,12 @@ where
         payload.retain(|&x| !(x.is_none() & core::mem::replace(&mut previous, x.is_none())));
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn find_gaps<E>(
         &self,
         fuzzer: &mut Z,
         executor: &mut E,
-        state: &mut <Self as UsesState>::State,
+        state: &mut S,
         manager: &mut EM,
         payload: &mut Vec<Option<u8>>,
         novelties: &[usize],
@@ -413,8 +417,7 @@ where
         split_char: u8,
     ) -> Result<(), Error>
     where
-        E: Executor<EM, Z> + HasObservers<Observers = OT, State = <Self as UsesState>::State>,
-        Z: UsesState<State = <Self as UsesState>::State>,
+        E: Executor<EM, Z, State = S> + HasObservers<Observers = OT>,
     {
         let mut start = 0;
         while start < payload.len() {
@@ -439,12 +442,12 @@ where
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn find_gaps_in_closures<E>(
         &self,
         fuzzer: &mut Z,
         executor: &mut E,
-        state: &mut <Self as UsesState>::State,
+        state: &mut S,
         manager: &mut EM,
         payload: &mut Vec<Option<u8>>,
         novelties: &[usize],
@@ -452,8 +455,7 @@ where
         closing_char: u8,
     ) -> Result<(), Error>
     where
-        E: Executor<EM, Z> + HasObservers<Observers = OT, State = <Self as UsesState>::State>,
-        Z: UsesState<State = <Self as UsesState>::State>,
+        E: Executor<EM, Z, State = S> + HasObservers<Observers = OT>,
     {
         let mut index = 0;
         while index < payload.len() {
