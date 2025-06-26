@@ -56,7 +56,6 @@ std = [
   "serde_json/std",
   "dep:nix",
   "serde/std",
-  "bincode",
   "wait-timeout",
   "uuid",
   "backtrace",
@@ -231,8 +230,7 @@ hashbrown = { workspace = true, features = [
 ], default-features = false } # A faster hashmap, nostd compatible
 num-traits = { workspace = true, default-features = false }
 serde = { workspace = true, features = ["alloc"] } # serialization lib
-postcard = { workspace = true } # no_std compatible serde serialization format
-bincode = { version = "2.0.1", optional = true, features = ["serde"] }
+postcard = { workspace = true }
 bitbybit = { workspace = true }
 arbitrary-int = { workspace = true }
 ahash = { workspace = true } # The hash function already used in hashbrown
