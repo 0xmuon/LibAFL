@@ -88,11 +88,12 @@ where
         self.inner.add_disabled(testcase)
     }
 
-    /// Replaces the testcase at the given idx
-    #[inline]
+    /// Replaces the testcase at `id` (same id, new testcase).
+    /// Inner save clears the in-memory input, drop `id` from `cached_indexes` so the RAM cache list matches.
     fn replace(&mut self, id: CorpusId, testcase: Testcase<I>) -> Result<Testcase<I>, Error> {
-        // TODO finish
-        self.inner.replace(id, testcase)
+        let old = self.inner.replace(id, testcase)?;
+        self.cached_indexes.borrow_mut().retain(|e| *e != id);
+        Ok(old)
     }
 
     /// Removes an entry from the corpus, returning it if it was present; considers both enabled and disabled testcases.
