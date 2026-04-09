@@ -301,7 +301,7 @@ mod tests {
     use std::fs;
 
     use crate::{
-        corpus::{cached::CachedOnDiskCorpus, Corpus, HasTestcase, Testcase},
+        corpus::{Corpus, HasTestcase, Testcase, cached::CachedOnDiskCorpus},
         inputs::BytesInput,
     };
 
@@ -320,9 +320,7 @@ mod tests {
             .add(Testcase::new(BytesInput::from(vec![0x41])))
             .expect("failed to add testcase");
         {
-            let mut tc = corpus
-                .testcase_mut(id)
-                .expect("failed to get testcase mut");
+            let mut tc = corpus.testcase_mut(id).expect("failed to get testcase mut");
             corpus
                 .load_input_into(&mut tc)
                 .expect("failed to load input into cache");
