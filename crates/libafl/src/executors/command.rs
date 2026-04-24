@@ -444,11 +444,7 @@ where
         _mgr: &mut EM,
         input: &I,
     ) -> Result<ExitKind, Error> {
-        self.observers_mut().pre_exec_all(state, input)?;
-        let exit_kind = self.execute_input_with_command(fuzzer, state, input)?;
-        self.observers_mut()
-            .post_exec_all(state, input, &exit_kind)?;
-        Ok(exit_kind)
+        self.execute_input_with_command(fuzzer, state, input)
     }
 }
 
@@ -485,8 +481,8 @@ where
     /// Linux specific low level implementation, to directly handle `fork`, `exec` and use linux
     /// `ptrace`
     ///
-    /// Hooks' `pre_exec` and observers' `pre_exec_child` are called with the child process stopped
-    /// just before the `exec` return (after forking).
+    /// Hooks' `pre_exec` is called with the child process stopped just before the `exec` return
+    /// (after forking).
     fn run_target(
         &mut self,
         fuzzer: &mut Z,
@@ -897,7 +893,10 @@ mod tests {
         state::NopState,
     };
     #[cfg(unix)]
-    use crate::{executors::StdChildArgs, observers::StdOutObserver};
+    use crate::{
+        executors::{HasObservers, StdChildArgs},
+        observers::{ObserversTuple, StdOutObserver},
+    };
 
     #[test]
     #[cfg_attr(miri, ignore)]
@@ -943,13 +942,19 @@ mod tests {
         let mut executor = executor.unwrap();
 
         let mut fuzzer: NopFuzzer = NopFuzzer::new();
+        let mut state = NopState::<NopInput>::new();
+        let input = BytesInput::new(b".".to_vec());
+
         executor
-            .run_target(
-                &mut fuzzer,
-                &mut NopState::<NopInput>::new(),
-                &mut mgr,
-                &BytesInput::new(b".".to_vec()),
-            )
+            .observers_mut()
+            .pre_exec_all(&mut state, &input)
+            .unwrap();
+        let exit_kind = executor
+            .run_target(&mut fuzzer, &mut state, &mut mgr, &input)
+            .unwrap();
+        executor
+            .observers_mut()
+            .post_exec_all(&mut state, &input, &exit_kind)
             .unwrap();
 
         assert!(executor.observers.0.output.is_some());
