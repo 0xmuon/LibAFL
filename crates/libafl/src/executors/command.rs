@@ -893,7 +893,10 @@ mod tests {
         state::NopState,
     };
     #[cfg(unix)]
-    use crate::{executors::StdChildArgs, observers::StdOutObserver};
+    use crate::{
+        executors::{HasObservers, StdChildArgs},
+        observers::{ObserversTuple, StdOutObserver},
+    };
 
     #[test]
     #[cfg_attr(miri, ignore)]
@@ -939,13 +942,20 @@ mod tests {
         let mut executor = executor.unwrap();
 
         let mut fuzzer: NopFuzzer = NopFuzzer::new();
+        let mut state = NopState::<NopInput>::new();
+        let input = BytesInput::new(b".".to_vec());
+
+        // Simulate the observer lifecycle the fuzzer normally provides around
+        // `run_target`. `StdOutObserver` uses an fd-backed capture on linux/macos and
+        // reads the captured bytes into `output` from `post_exec`, so we must invoke
+        // it here (there is no fuzzer wrapping `run_target` in this standalone test).
+        executor.observers_mut().pre_exec_all(&mut state, &input).unwrap();
+        let exit_kind = executor
+            .run_target(&mut fuzzer, &mut state, &mut mgr, &input)
+            .unwrap();
         executor
-            .run_target(
-                &mut fuzzer,
-                &mut NopState::<NopInput>::new(),
-                &mut mgr,
-                &BytesInput::new(b".".to_vec()),
-            )
+            .observers_mut()
+            .post_exec_all(&mut state, &input, &exit_kind)
             .unwrap();
 
         assert!(executor.observers.0.output.is_some());
