@@ -949,7 +949,10 @@ mod tests {
         // `run_target`. `StdOutObserver` uses an fd-backed capture on linux/macos and
         // reads the captured bytes into `output` from `post_exec`, so we must invoke
         // it here (there is no fuzzer wrapping `run_target` in this standalone test).
-        executor.observers_mut().pre_exec_all(&mut state, &input).unwrap();
+        executor
+            .observers_mut()
+            .pre_exec_all(&mut state, &input)
+            .unwrap();
         let exit_kind = executor
             .run_target(&mut fuzzer, &mut state, &mut mgr, &input)
             .unwrap();
